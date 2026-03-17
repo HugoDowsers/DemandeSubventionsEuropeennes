@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Horizon Europe – Application Form</title>
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div class="header-logo">
+      <span class="he-badge">HE</span>
+      <div>
+        <div class="header-title">Horizon Europe – Application Form</div>
+        <div class="header-sub" id="header-subtitle">Budget Lump Sum + Part B (DEP)</div>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="btn btn-gold" onclick="openSessionsPanel()">💾 Sessions</button>
+      <button class="btn btn-ghost" onclick="resetAll()">🔄 Réinitialiser</button>
+    </div>
+  </div>
+  <nav class="tabs" id="main-tabs">
+    <button class="tab active" data-tab="project">📋 Projet</button>
+    <button class="tab" data-tab="beneficiaries">🏛️ Bénéficiaires</button>
+    <button class="tab" data-tab="workpackages">📦 Work Packages</button>
+    <button class="tab" data-tab="costs">💶 Budget</button>
+    <button class="tab" data-tab="partb">📝 Part B</button>
+    <button class="tab" data-tab="depreciation">🔧 Amortissements</button>
+    <button class="tab" data-tab="comments">💬 Commentaires</button>
+    <button class="tab tab-results" data-tab="results">📊 Résultats</button>
+  </nav>
+</header>
+
+<main>
+
+<!-- TAB: PROJECT -->
+<section id="tab-project" class="tab-content active">
+  <div class="card">
+    <h2>Informations générales du projet</h2>
+    <div class="form-row">
+      <div class="form-group"><label>Titre du projet</label>
+        <input type="text" id="project_title" placeholder="Ex: Advanced Research on..." oninput="autoSaveProject()"></div>
+      <div class="form-group"><label>Acronyme</label>
+        <input type="text" id="project_acronym" placeholder="Ex: RESILIENCE" oninput="autoSaveProject()"></div>
+    </div>
+    <div class="form-row">
+      <div class="form-group"><label>Contact coordinateur</label>
+        <input type="text" id="coordinator_contact" placeholder="Prénom NOM, Organisation" oninput="autoSaveProject()"></div>
+      <div class="form-group"><label>Durée du projet (mois)</label>
+        <input type="number" id="project_duration_months" value="24" min="1" max="120" oninput="autoSaveProject()"></div>
+    </div>
+    <div class="info-box" style="margin-top:1rem">
+      <strong>ℹ️ Ce formulaire couvre</strong>
+      <ul>
+        <li><strong>Budget Lump Sum</strong> — équivalent du fichier Excel <code>.xlsm</code> (bénéficiaires, WP, coûts A→D, amortissements)</li>
+        <li><strong>Part B (DEP)</strong> — formulaire narratif complet (résumé, pertinence, mise en œuvre, impact, plan de travail, tableaux WP)</li>
+        <li><strong>Salaires par employé</strong> — saisie individuelle des salaires mensuels par bénéficiaire</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- TAB: BENEFICIARIES -->
+<section id="tab-beneficiaries" class="tab-content">
+  <div class="card">
+    <div class="section-header">
+      <h2>🏛️ Bénéficiaires (BE)</h2>
+      <button class="btn btn-primary" onclick="showAddBE()">+ Ajouter un BE</button>
+    </div>
+    <div class="empty-state" id="be-empty">Aucun bénéficiaire. Cliquez sur « Ajouter un BE ».</div>
+    <table class="data-table" id="be-table" style="display:none">
+      <thead><tr><th>N°</th><th>Rôle</th><th>Nom</th><th>Acronyme</th><th>Pays</th><th>Taux</th><th>Type</th><th>Actions</th></tr></thead>
+      <tbody id="be-tbody"></tbody>
+    </table>
+  </div>
+
+  <!-- Employees per BE -->
+  <div class="card" id="employees-card" style="display:none">
+    <div class="section-header">
+      <h2>👥 Équipe & Salaires</h2>
+      <div style="display:flex;gap:.5rem;align-items:center">
+        <select id="emp-be-select" onchange="loadEmployeesForBE()" style="padding:.4rem .75rem;border:1.5px solid var(--border);border-radius:6px;font-size:.88rem">
+          <option value="">-- Sélectionner un BE --</option>
+        </select>
+        <button class="btn btn-primary" onclick="addEmployee()">+ Ajouter un employé</button>
+      </div>
+    </div>
+    <div class="info-box">Le salaire mensuel brut chargé (charges patronales incluses) sert de <strong>coût/item</strong> dans l'onglet Budget. Vous pourrez l'associer à une catégorie de personnel par BE×WP.</div>
+    <table class="data-table" id="employees-table">
+      <thead><tr><th>Nom</th><th>Prénom</th><th>Profil</th><th>Salaire mensuel brut (€)</th><th>Note</th><th></th></tr></thead>
+      <tbody id="employees-tbody"><tr><td colspan="6" class="empty-state">Sélectionnez un bénéficiaire.</td></tr></tbody>
+    </table>
+    <div style="margin-top:1rem"><button class="btn btn-secondary" onclick="saveEmployees()">💾 Enregistrer les employés</button></div>
+  </div>
+</section>
+
+<!-- TAB: WORK PACKAGES -->
+<section id="tab-workpackages" class="tab-content">
+  <div class="card">
+    <div class="section-header">
+      <h2>📦 Work Packages</h2>
+      <button class="btn btn-primary" onclick="showAddWP()">+ Ajouter un WP</button>
+    </div>
+    <div class="empty-state" id="wp-empty">Aucun work package. Cliquez sur « Ajouter un WP ».</div>
+    <table class="data-table" id="wp-table" style="display:none">
+      <thead><tr><th>N°</th><th>Nom</th><th>Lead</th><th>Mois début</th><th>Mois fin</th><th>Actions</th></tr></thead>
+      <tbody id="wp-tbody"></tbody>
+    </table>
+  </div>
+  <div class="card" id="wp-detail-card" style="display:none">
+    <div class="section-header">
+      <h2>🔍 Détail WP</h2>
+      <select id="wp-detail-select" onchange="loadWPDetail()" style="padding:.4rem .75rem;border:1.5px solid var(--border);border-radius:6px;font-size:.88rem">
+        <option value="">-- Sélectionner --</option>
+      </select>
+    </div>
+    <div id="wp-detail-body"></div>
+  </div>
+</section>
+
+<!-- TAB: COSTS/BUDGET -->
+<section id="tab-costs" class="tab-content">
+  <div class="card">
+    <h2>💶 Saisie des coûts par Bénéficiaire × Work Package</h2>
+    <div class="selector-row">
+      <div class="form-group"><label>Bénéficiaire</label>
+        <select id="cost-be-select" onchange="loadCostForm()"><option value="">-- Sélectionner --</option></select></div>
+      <div class="form-group"><label>Work Package</label>
+        <select id="cost-wp-select" onchange="loadCostForm()"><option value="">-- Sélectionner --</option></select></div>
+    </div>
+    <div id="cost-form-container"></div>
+  </div>
+</section>
+
+<!-- TAB: PART B -->
+<section id="tab-partb" class="tab-content">
+  <div class="partb-nav">
+    <button class="pb-tab active" data-pb="pb-summary">Résumé</button>
+    <button class="pb-tab" data-pb="pb-relevance">1. Pertinence</button>
+    <button class="pb-tab" data-pb="pb-implementation">2. Mise en œuvre</button>
+    <button class="pb-tab" data-pb="pb-impact">3. Impact</button>
+    <button class="pb-tab" data-pb="pb-workplan">4. Plan de travail</button>
+    <button class="pb-tab" data-pb="pb-other">5. Autre & Déclarations</button>
+  </div>
+
+  <!-- SUMMARY -->
+  <div id="pb-summary" class="pb-section active">
+    <div class="card"><h2>Résumé du projet (Project Summary)</h2>
+      <div class="form-group"><label>Résumé</label>
+        <textarea id="pb_summary" rows="6" placeholder="Voir Partie A..." oninput="autoSavePartB('summary',this.value)"></textarea></div>
+    </div>
+  </div>
+
+  <!-- RELEVANCE -->
+  <div id="pb-relevance" class="pb-section">
+    <div class="card"><h2>1.1 Objectifs et activités</h2>
+      <div class="form-group"><textarea id="pb_objectives" rows="7" placeholder="Comment le projet est-il aligné avec les objectifs du Call ?" oninput="autoSavePartB('objectives',this.value)"></textarea></div></div>
+    <div class="card"><h2>1.2 Contribution aux objectifs politiques à long terme</h2>
+      <div class="form-group"><textarea id="pb_policy_contribution" rows="6" placeholder="Contribution aux politiques et stratégies européennes..." oninput="autoSavePartB('policy_contribution',this.value)"></textarea></div></div>
+    <div class="card"><h2>1.3 Chaîne d'approvisionnement numérique</h2>
+      <div class="form-group"><textarea id="pb_digital_supply_chain" rows="5" placeholder="Dans quelle mesure le projet renforce-t-il la chaîne numérique ? (si applicable)" oninput="autoSavePartB('digital_supply_chain',this.value)"></textarea></div></div>
+    <div class="card"><h2>1.4 Obstacles financiers</h2>
+      <div class="form-group"><textarea id="pb_financial_obstacles" rows="5" placeholder="Comment le projet surmonte-t-il les obstacles financiers ? (si applicable)" oninput="autoSavePartB('financial_obstacles',this.value)"></textarea></div></div>
+  </div>
+
+  <!-- IMPLEMENTATION -->
+  <div id="pb-implementation" class="pb-section">
+    <div class="card"><h2>2.1 Maturité</h2>
+      <div class="form-group"><textarea id="pb_maturity" rows="6" placeholder="État de préparation et capacité à démarrer..." oninput="autoSavePartB('maturity',this.value)"></textarea></div></div>
+    <div class="card"><h2>2.2 Plan de mise en œuvre</h2>
+      <div class="form-group"><label>Plan de mise en œuvre</label>
+        <textarea id="pb_implementation_plan" rows="7" placeholder="Justification des WP, cohérence objectifs/activités/ressources..." oninput="autoSavePartB('implementation_plan',this.value)"></textarea></div>
+      <div class="form-group" style="margin-top:1rem"><label>Gestion de projet, assurance qualité et suivi</label>
+        <textarea id="pb_project_management" rows="6" placeholder="Mesures de qualité, méthodes de suivi, indicateurs..." oninput="autoSavePartB('project_management',this.value)"></textarea></div>
+      <div class="form-group" style="margin-top:1rem"><label>Rentabilité et gestion financière</label>
+        <textarea id="pb_cost_effectiveness" rows="5" placeholder="Comment les résultats seront-ils atteints de manière rentable ?" oninput="autoSavePartB('cost_effectiveness',this.value)"></textarea></div></div>
+    <div class="card">
+      <div class="section-header"><h2>Risques critiques</h2>
+        <button class="btn btn-primary" onclick="addRisk()">+ Ajouter un risque</button></div>
+      <table class="data-table" id="risks-table">
+        <thead><tr><th>N°</th><th>Description</th><th>WP</th><th>Mesures d'atténuation</th><th>Impact</th><th>Probabilité</th><th></th></tr></thead>
+        <tbody id="risks-tbody"></tbody>
+      </table></div>
+    <div class="card"><h2>2.3 Capacité à réaliser le travail</h2>
+      <div class="form-group"><label>Coopération au sein du consortium</label>
+        <textarea id="pb_consortium_cooperation" rows="6" placeholder="Participants, complémentarité, division des rôles..." oninput="autoSavePartB('consortium_cooperation',this.value)"></textarea></div>
+      <div class="form-group" style="margin-top:1rem">
+        <div class="section-header" style="margin-bottom:.5rem"><label>Équipes et personnel du projet</label>
+          <button class="btn btn-sm btn-primary" onclick="addStaffRow()">+ Ajouter</button></div>
+        <table class="data-table" id="staff-table">
+          <thead><tr><th>Nom et fonction</th><th>Organisation</th><th>Rôle / Tâches / Profil</th><th></th></tr></thead>
+          <tbody id="staff-tbody"></tbody>
+        </table></div>
+      <div class="form-group" style="margin-top:1rem"><label>Ressources externes (sous-traitance, détachement…)</label>
+        <textarea id="pb_outside_resources" rows="4" placeholder="Si vous n'avez pas toutes les compétences en interne..." oninput="autoSavePartB('outside_resources',this.value)"></textarea></div>
+      <div class="form-group" style="margin-top:1rem"><label>Gestion du consortium et prise de décision</label>
+        <textarea id="pb_consortium_management" rows="4" placeholder="Structures de gestion, mécanismes de décision..." oninput="autoSavePartB('consortium_management',this.value)"></textarea></div>
+    </div>
+  </div>
+
+  <!-- IMPACT -->
+  <div id="pb-impact" class="pb-section">
+    <div class="card"><h2>3.1 Résultats attendus et diffusion</h2>
+      <div class="form-group"><label>Résultats et livrables attendus</label>
+        <textarea id="pb_expected_outcomes" rows="7" placeholder="Dans quelle mesure le projet atteindra-t-il les impacts attendus ?" oninput="autoSavePartB('expected_outcomes',this.value)"></textarea></div>
+      <div class="form-group" style="margin-top:1rem"><label>Diffusion et communication</label>
+        <textarea id="pb_dissemination" rows="6" placeholder="Activités de communication, groupes cibles, canaux, visibilité du financement EU..." oninput="autoSavePartB('dissemination',this.value)"></textarea></div></div>
+    <div class="card"><h2>3.2 Compétitivité et bénéfices pour la société</h2>
+      <div class="form-group"><textarea id="pb_competitiveness" rows="6" placeholder="Dans quelle mesure le projet renforcera-t-il la compétitivité ?" oninput="autoSavePartB('competitiveness',this.value)"></textarea></div></div>
+    <div class="card"><h2>3.3 Durabilité environnementale et Green Deal</h2>
+      <div class="form-group"><textarea id="pb_environmental" rows="5" placeholder="Contribution à la durabilité environnementale et aux objectifs du Green Deal (si applicable)" oninput="autoSavePartB('environmental',this.value)"></textarea></div></div>
+  </div>
+
+  <!-- WORK PLAN -->
+  <div id="pb-workplan" class="pb-section">
+    <div class="card"><h2>4.1 Vue d'ensemble du plan de travail</h2>
+      <div class="form-group"><textarea id="pb_work_plan_overview" rows="6" placeholder="Structure générale du plan de travail (liste des WP ou présentation graphique)..." oninput="autoSavePartB('work_plan_overview',this.value)"></textarea></div></div>
+    <div class="card">
+      <div class="section-header"><h2>4.2 Sous-traitance</h2>
+        <button class="btn btn-primary" onclick="addSubcontract()">+ Ajouter</button></div>
+      <table class="data-table" id="subcontracting-table">
+        <thead><tr><th>WP</th><th>N° sous-contrat</th><th>Nom</th><th>Description</th><th>Coût (€)</th><th>Justification</th><th>Best Value</th><th></th></tr></thead>
+        <tbody id="subcontracting-tbody"></tbody>
+      </table>
+      <div style="margin-top:1rem"><button class="btn btn-secondary" onclick="saveSubcontracting()">💾 Enregistrer</button></div></div>
+    <div class="card" id="gantt-card">
+      <div class="section-header">
+        <h2>📅 Gantt interactif — Tâches & ETP</h2>
+        <div style="display:flex;gap:.5rem;align-items:center">
+          <label style="font-size:.82rem;color:var(--text-muted);font-weight:600">WP :</label>
+          <select id="gantt-wp-select" onchange="renderGantt()" style="padding:.35rem .65rem;border:1.5px solid var(--border);border-radius:6px;font-size:.85rem">
+            <option value="">Tous les WP</option>
+          </select>
+          <button class="btn btn-gold" onclick="applyGanttToEtp()">⚡ Recalculer ETP & Budget</button>
+          <button class="btn btn-secondary" onclick="saveGantt()">💾 Enregistrer</button>
+        </div>
+      </div>
+      <div class="info-box">
+        <strong>Cliquez</strong> sur un mois pour l'activer/désactiver. <strong>Glissez</strong> pour sélectionner plusieurs mois d'un coup.
+        La durée de chaque tâche × l'ETP mensuel par contributeur recalcule automatiquement les person-mois dans le budget.
+      </div>
+      <div id="gantt-container"></div>
+      <div id="gantt-etp-summary" style="margin-top:1rem"></div>
+    </div>
+    <div class="card">
+      <div class="section-header"><h2>4.4 Projets précédents</h2>
+        <button class="btn btn-primary" onclick="addPreviousProject()">+ Ajouter</button></div>
+      <table class="data-table" id="prev-projects-table">
+        <thead><tr><th>Participant</th><th>Référence & Titre</th><th>Période</th><th>Rôle</th><th>Montant (€)</th><th>Site web</th><th></th></tr></thead>
+        <tbody id="prev-projects-tbody"></tbody>
+      </table>
+      <div style="margin-top:1rem"><button class="btn btn-secondary" onclick="savePreviousProjects()">💾 Enregistrer</button></div></div>
+  </div>
+
+  <!-- OTHER -->
+  <div id="pb-other" class="pb-section">
+    <div class="card"><h2>5.1 Éthique</h2>
+      <div class="form-group"><textarea id="pb_ethics" rows="4" placeholder="Voir Formulaire de candidature Partie A." oninput="autoSavePartB('ethics',this.value)"></textarea></div></div>
+    <div class="card"><h2>5.2 Sécurité</h2>
+      <div class="form-group"><textarea id="pb_security" rows="4" placeholder="Voir Formulaire de candidature Partie A." oninput="autoSavePartB('security',this.value)"></textarea></div></div>
+    <div class="card"><h2>6. Déclarations — Double financement</h2>
+      <div class="form-group">
+        <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer">
+          <input type="checkbox" id="pb_double_funding_confirmed" onchange="autoSavePartB('double_funding_confirmed',this.checked)" style="width:auto">
+          Nous confirmons qu'à notre connaissance, aucun projet ne bénéficie ou ne bénéficiera d'une autre subvention UE.</label></div>
+      <div class="form-group"><label>Si NON — détails :</label>
+        <textarea id="pb_double_funding_detail" rows="3" oninput="autoSavePartB('double_funding_detail',this.value)"></textarea></div>
+      <div class="form-group"><label>Justification soutien financier à des tiers (si applicable)</label>
+        <textarea id="pb_financial_support_justification" rows="3" oninput="autoSavePartB('financial_support_justification',this.value)"></textarea></div></div>
+  </div>
+</section>
+
+<!-- TAB: DEPRECIATION -->
+<section id="tab-depreciation" class="tab-content">
+  <div class="card">
+    <div class="section-header"><h2>🔧 Coûts d'amortissement (C.2 Équipements)</h2>
+      <button class="btn btn-primary" onclick="addDepreciationRow()">+ Ajouter</button></div>
+    <div class="info-box">Coût chargé = Prix d'achat × % utilisé pour le projet × % de vie utile dans le projet. Reportez le résultat manuellement dans C.2 du formulaire Budget.</div>
+    <div style="overflow-x:auto">
+    <table class="data-table" id="depreciation-table">
+      <thead><tr><th>BE</th><th>WP</th><th>Type</th><th>Description</th><th>Date achat</th><th>Prix (€)</th><th>% projet</th><th>% vie utile</th><th>Coût chargé (€)</th><th>Justification</th><th></th></tr></thead>
+      <tbody id="depreciation-tbody"></tbody>
+    </table></div>
+    <div style="margin-top:1rem"><button class="btn btn-secondary" onclick="saveDepreciation()">💾 Sauvegarder</button></div>
+  </div>
+</section>
+
+<!-- TAB: COMMENTS -->
+<section id="tab-comments" class="tab-content">
+  <div class="card">
+    <div class="section-header"><h2>💬 Commentaires & Justifications</h2>
+      <button class="btn btn-primary" onclick="addComment()">+ Ajouter</button></div>
+    <table class="data-table" id="comments-table">
+      <thead><tr><th>N°</th><th>Réf. BE</th><th>Réf. WP</th><th>Commentaire</th><th></th></tr></thead>
+      <tbody id="comments-tbody"></tbody>
+    </table>
+    <div style="margin-top:1rem"><button class="btn btn-secondary" onclick="saveComments()">💾 Sauvegarder</button></div>
+  </div>
+</section>
+
+<!-- TAB: RESULTS -->
+<section id="tab-results" class="tab-content">
+  <div id="results-container"><div class="empty-state">Cliquez sur « Calculer les résultats ».</div></div>
+  <div style="text-align:center;margin-top:1.5rem;display:flex;gap:1rem;justify-content:center;flex-wrap:wrap">
+    <button class="btn btn-primary btn-large" onclick="loadResults()">📊 Calculer les résultats</button>
+    <button class="btn btn-gold btn-large" onclick="exportRTF()">📄 Exporter en RTF</button>
+  </div>
+</section>
+
+</main>
+
+<!-- SESSIONS PANEL -->
+<div id="sessions-overlay" class="sessions-overlay" onclick="closeSessionsPanel()">
+  <div class="sessions-panel" onclick="event.stopPropagation()">
+    <div class="sessions-header"><h3>💾 Sessions sauvegardées</h3>
+      <button class="modal-close" onclick="closeSessionsPanel()">✕</button></div>
+    <div class="sessions-body">
+      <div class="sessions-save-form">
+        <div style="display:flex;gap:.5rem;align-items:flex-end">
+          <div class="form-group" style="flex:1;margin-bottom:0"><label>Nom de la session</label>
+            <input type="text" id="session-name-input" placeholder="Ex: Projet RESILIENCE v2" onkeydown="if(event.key==='Enter')saveSession()"></div>
+          <button class="btn btn-primary" onclick="saveSession()">💾 Sauvegarder</button>
+        </div>
+      </div>
+      <div class="empty-state" id="sessions-empty">Aucune session sauvegardée.</div>
+      <div id="sessions-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- MODAL -->
+<div id="modal-overlay" class="modal-overlay" onclick="closeModal()">
+  <div class="modal" onclick="event.stopPropagation()">
+    <div class="modal-header"><h3 id="modal-title">Titre</h3>
+      <button class="modal-close" onclick="closeModal()">✕</button></div>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+const COUNTRIES = {{ countries | tojson }};
+const FUNDING_RATES = {{ funding_rates | tojson }};
+const COST_CATEGORIES = {{ cost_categories | tojson }};
+const STAFF_PROFILES = {{ staff_profiles | tojson }};
+const SME_RATE = {{ sme_rate }};
+</script>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

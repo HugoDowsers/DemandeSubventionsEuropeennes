@@ -225,6 +225,102 @@ main{max-width:1200px;margin:1.5rem auto;padding:0 1.5rem}
 .etp-sum-row { display: grid; grid-template-columns: 2fr 1fr 1fr; padding: .4rem 1rem; border-top: 1px solid #fde68a; font-size: .85rem; }
 .etp-sum-row:hover { background: #fef9c3; }
 
+/* ---- ETP per-person table (etpm-*) ---- */
+.etpm-wrap { margin-top:.5rem; border:1.5px solid var(--gold); border-radius:7px; overflow:hidden; }
+.etpm-table { border-collapse:collapse; font-size:.8rem; width:100%; }
+.etpm-table thead th { background:var(--blue); color:#fff; padding:.4rem .6rem; text-align:left; font-size:.75rem; font-weight:600; white-space:nowrap; }
+.etpm-name-th  { min-width:140px; }
+.etpm-etp-th   { text-align:center !important; min-width:100px; }
+.etpm-pm-th    { text-align:right !important; min-width:90px; background:#002288; }
+
+.etpm-row { border-top:1px solid #fde68a; background:#fffbeb; }
+.etpm-row:hover { background:#fef9c3; }
+.etpm-name { padding:.4rem .6rem; vertical-align:middle; }
+.etpm-org  { font-size:.7rem; color:var(--text-muted); margin-top:.1rem; }
+.etpm-salary { font-size:.7rem; color:var(--blue); font-weight:600; margin-top:.1rem; }
+
+.etpm-etp-cell { padding:.3rem .6rem; text-align:center; vertical-align:middle; }
+.etpm-rate {
+  width:72px; border:1.5px solid #d4b800; border-radius:5px;
+  padding:.3rem .4rem; text-align:center; font-size:.88rem;
+  font-weight:700; color:var(--blue); background:#fff;
+  display:block; margin:0 auto;
+}
+.etpm-rate:focus { outline:none; border-color:var(--blue); box-shadow:0 0 0 2px rgba(0,51,153,.15); }
+.etpm-etp-label { font-size:.68rem; color:var(--text-muted); margin-top:.2rem; }
+
+.etpm-pm-cell  { padding:.3rem .6rem; text-align:right; vertical-align:middle; background:#fff8e1; font-size:.82rem; }
+.etpm-dur  { font-size:.68rem; color:var(--text-muted); }
+.etpm-cost { font-size:.72rem; color:var(--success); font-weight:600; }
+
+.etpm-sum-row { background:var(--gold); border-top:2px solid #d4b800; }
+.etpm-sum-row td { padding:.4rem .6rem; font-size:.82rem; color:var(--blue); }
+
+/* ---- BUDGET RESOURCES TABLE (WP detail) ---- */
+.budget-res-table { border-collapse:collapse; font-size:.78rem; min-width:900px; width:100%; }
+.budget-res-table th { background:var(--blue); color:#fff; padding:.45rem .5rem; text-align:right; font-size:.72rem; font-weight:600; border:1px solid #224499; white-space:nowrap; }
+.budget-res-table td { border:1px solid #e2e8f0; padding:.35rem .5rem; vertical-align:middle; }
+.brt-participant { text-align:left !important; min-width:140px; background:#f8faff; font-size:.82rem; position:sticky; left:0; }
+.brt-pm { text-align:center !important; min-width:70px; background:#f0f4ff; }
+.brt-cost { text-align:right; min-width:90px; }
+.brt-highlight { background:#eff6ff; color:var(--blue); font-weight:600; }
+.brt-total { background:#eff6ff; font-weight:700; color:var(--blue); }
+.brt-be-badge { background:var(--blue); color:#fff; border-radius:3px; padding:.1rem .35rem; font-size:.68rem; font-weight:700; }
+.brt-salary { display:block; font-size:.68rem; color:var(--text-muted); }
+.brt-first-row td { border-top:2px solid var(--blue); }
+.brt-emp-row td { background:#fafbff; }
+.brt-be-row td { background:#f8faff; font-style:italic; }
+.brt-total-row td { background:var(--blue); color:#fff; font-weight:700; border-top:2px solid #002288; }
+.brt-total-row .brt-participant { background:var(--blue); color:#fff; }
+.budget-res-table th:first-child, .brt-participant { text-align:left !important; }
+
+/* ---- VERIFICATION ETP ---- */
+.vcheck-summary {
+  display:flex; gap:1rem; flex-wrap:wrap; margin-bottom:1.5rem;
+  background:#f8faff; border:1.5px solid var(--border); border-radius:8px; padding:1rem;
+}
+.vcheck-sum-item { display:flex; align-items:center; gap:.5rem; font-size:.9rem; }
+.vcheck-sum-item.error { color:var(--danger); }
+.vcheck-sum-item.warn  { color:#b45309; }
+.vcheck-sum-item.ok    { color:var(--success); }
+.vcheck-sum-icon { font-size:1.1rem; }
+
+.vcheck-card { border:1.5px solid var(--border); border-radius:8px; margin-bottom:1rem; overflow:hidden; }
+.vcheck-card.error  { border-color:#fca5a5; }
+.vcheck-card.warning{ border-color:#fcd34d; }
+.vcheck-card.ok     { border-color:#86efac; }
+
+.vcheck-header {
+  display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap;
+  gap:.5rem; padding:.75rem 1rem;
+}
+.vcheck-card.error   .vcheck-header { background:#fff1f2; }
+.vcheck-card.warning .vcheck-header { background:#fffbeb; }
+.vcheck-card.ok      .vcheck-header { background:#f0fdf4; }
+
+.vcheck-icon   { font-size:1.1rem; margin-right:.35rem; }
+.vcheck-be     { font-size:.78rem; color:var(--text-muted); margin-left:.4rem; }
+.vcheck-badge  { font-size:.75rem; padding:.15rem .5rem; border-radius:12px; margin-left:.5rem; font-weight:700; }
+.vcheck-badge.error { background:#fee2e2; color:var(--danger); }
+.vcheck-stats  { display:flex; align-items:center; gap:.75rem; font-size:.82rem; }
+.vcheck-status-badge { padding:.2rem .6rem; border-radius:12px; font-weight:700; font-size:.75rem; }
+.vcheck-status-badge.error   { background:#fee2e2; color:var(--danger); }
+.vcheck-status-badge.warning { background:#fef9c3; color:#b45309; }
+.vcheck-status-badge.ok      { background:#dcfce7; color:var(--success); }
+.vcheck-detail { padding:.5rem 1rem; font-size:.82rem; background:#fff1f2; border-top:1px solid #fca5a5; color:var(--danger); }
+
+/* Verification monthly bar table */
+.vtbl { border-collapse:collapse; font-size:.72rem; min-width:400px; }
+.vtbl th, .vtbl td { border:1px solid var(--border); }
+.vtbl-name-th { background:var(--blue); color:#fff; padding:.3rem .5rem; text-align:left; white-space:nowrap; min-width:60px; }
+.vtbl-mth-th  { background:#002288; color:#fff; padding:.25rem .2rem; text-align:center; min-width:34px; font-weight:500; }
+.vtbl-row-label { background:#f8faff; padding:.2rem .5rem; font-weight:600; color:var(--blue); white-space:nowrap; }
+.vtbl-cell { text-align:center; padding:.1rem .1rem; height:52px; vertical-align:bottom; min-width:34px; }
+.vtbl-empty { color:#d1d5db; vertical-align:middle; font-size:.7rem; }
+.vtbl-bar-wrap { height:28px; display:flex; align-items:flex-end; justify-content:center; margin-bottom:2px; }
+.vtbl-bar { width:18px; border-radius:2px 2px 0 0; min-height:2px; transition:height .2s; }
+.vtbl-val { font-size:.68rem; font-weight:700; line-height:1; }
+
 /* ---- GANTT ---- */
 .gantt-wrap { overflow-x: auto; border-radius: 8px; border: 1px solid var(--border); }
 .gantt-table { border-collapse: collapse; font-size: .8rem; min-width: 600px; user-select: none; }

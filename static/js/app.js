@@ -5,6 +5,24 @@ let empCurrentBE = '';
 async function init() {
   const res = await fetch('/api/state');
   state = await res.json();
+  
+  // If state is empty (new server start / no workstate file), 
+  // auto-load the most recent saved session
+  if (!state.beneficiaries?.length && !state.project_title) {
+    const sessRes = await fetch('/api/sessions');
+    const sessions = await sessRes.json();
+    if (sessions.length > 0) {
+      // Auto-load most recent session silently
+      const mostRecent = sessions[0]; // already sorted by date desc
+      const loadRes = await fetch(`/api/sessions/${mostRecent.id}`);
+      const loadJson = await loadRes.json();
+      if (loadJson.ok) {
+        state = loadJson.state;
+        showToast(`Session « ${mostRecent.name} » chargée automatiquement`);
+      }
+    }
+  }
+  
   renderAll();
 }
 
@@ -23,8 +41,10 @@ function renderAll() {
   renderDepreciation();
   renderComments();
   renderSubcontracting();
+  wpTasks = {}; wpMilestones = {}; wpDeliverables = {}; // reset local caches before reload
+  resetWpTasksCache(); // sync fresh from state, clear dirty flags
   populateGanttWPSelect();
-  renderGantt();
+  renderGantt(); // renderGantt calls syncWpTasksFromState internally
   renderPreviousProjects();
   renderRisks();
   renderStaffTable();
@@ -58,6 +78,7 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
     if (tab.dataset.tab === 'costs') populateCostSelects();
     if (tab.dataset.tab === 'workpackages') renderWPDetailSelect();
+    if (tab.dataset.tab === 'verification') runEtpVerification();
   });
 });
 
@@ -98,7 +119,7 @@ function autoSavePartB(field, value) {
     await fetch('/api/part_b', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({[field]: value}) });
     if (!state.part_b) state.part_b = {};
     state.part_b[field] = value;
-  }, 600);
+  }, 300);
 }
 
 // ---- BENEFICIARIES ----
@@ -204,13 +225,13 @@ function renderEmployees() {
   if (!localEmployees.length) { tbody.innerHTML='<tr><td colspan="6" class="empty-state">Aucun employé. Cliquez sur « Ajouter un employé ».</td></tr>'; return; }
   tbody.innerHTML = localEmployees.map((e,i) => `
     <tr>
-      <td><input type="text" value="${esc(e.last_name||'')}" onchange="localEmployees[${i}].last_name=this.value" placeholder="NOM"></td>
-      <td><input type="text" value="${esc(e.first_name||'')}" onchange="localEmployees[${i}].first_name=this.value" placeholder="Prénom"></td>
-      <td><select onchange="localEmployees[${i}].profile=this.value">
+      <td><input type="text" value="${esc(e.last_name||'')}" onchange="localEmployees[${i}].last_name=this.value;debouncedSave('employees', saveEmployees)" placeholder="NOM"></td>
+      <td><input type="text" value="${esc(e.first_name||'')}" onchange="localEmployees[${i}].first_name=this.value;debouncedSave('employees', saveEmployees)" placeholder="Prénom"></td>
+      <td><select onchange="localEmployees[${i}].profile=this.value;debouncedSave('employees', saveEmployees)">
         ${STAFF_PROFILES.filter(p=>!p.fixed_rate).map(p=>`<option value="${p.id}" ${e.profile===p.id?'selected':''}>${p.label}</option>`).join('')}
       </select></td>
-      <td><input type="number" min="0" step="1" value="${e.monthly_salary||''}" onchange="localEmployees[${i}].monthly_salary=parseFloat(this.value)||0" placeholder="Ex: 6500"></td>
-      <td><input type="text" value="${esc(e.note||'')}" onchange="localEmployees[${i}].note=this.value" placeholder="Note"></td>
+      <td><input type="number" min="0" step="1" value="${e.monthly_salary||''}" onchange="localEmployees[${i}].monthly_salary=parseFloat(this.value)||0;debouncedSave('employees', saveEmployees)" placeholder="Ex: 6500"></td>
+      <td><input type="text" value="${esc(e.note||'')}" onchange="localEmployees[${i}].note=this.value;debouncedSave('employees', saveEmployees)" placeholder="Note"></td>
       <td><button class="btn btn-sm btn-danger" onclick="deleteEmployee(${i})">🗑️</button></td>
     </tr>`).join('');
 }
@@ -344,8 +365,189 @@ function loadWPDetail() {
       <table class="data-table"><thead><tr><th>N°</th><th>Nom</th><th>Lead</th><th>Type</th><th>Diffusion</th><th>Mois</th><th>Description</th><th></th></tr></thead>
       <tbody id="deliverables-tbody-${wpId}"></tbody></table>
       <div style="margin-top:.75rem"><button class="btn btn-sm btn-secondary" onclick="saveDeliverables('${wpId}')">💾 Enregistrer livrables</button></div>
+    </div>
+    <div class="card" id="budget-resources-${wpId}">
+      <div class="section-header">
+        <h2>💶 Estimated Budget — Resources (${wpId})</h2>
+        <button class="btn btn-sm btn-gold" onclick="refreshWPBudgetTable('${wpId}')">🔄 Recalculer</button>
+      </div>
+      <div id="budget-resources-body-${wpId}"></div>
+      <p style="margin-top:.75rem;font-size:.78rem;color:var(--text-muted);font-style:italic">
+        Pour les Lump Sum Grants, voir le tableau de budget détaillé (annexe 1 de la Partie B).
+      </p>
     </div>`;
   renderTasks(wpId); renderMilestones(wpId); renderDeliverables(wpId);
+  renderWPBudgetTable(wpId);
+}
+
+function renderWPBudgetTable(wpId) {
+  const el = document.getElementById(`budget-resources-body-${wpId}`);
+  if (!el) return;
+
+  const collab = getAllCollaborators();
+  const wp = (state.work_packages||[]).find(w => w.id === wpId);
+  const wpDuration = wp ? ((wp.end_month||24) - (wp.start_month||1) + 1) : 24;
+  const tasks = wpTasks[wpId] || state.tasks?.[wpId] || [];
+  const costs = state.costs || {};
+
+  // --- Compute per-person personnel costs from ETP ---
+  // empId → { pm, cost, be_id, label }
+  const empData = {};
+  tasks.forEach(task => {
+    const taskMonths = task.months || [];
+    const duration = taskMonths.length > 0 ? taskMonths.length : wpDuration;
+    const etp = task.etp || {};
+    const etpm = task.etp_months || {};
+    (task.participants_list||[]).forEach(collabId => {
+      const c = collab.find(x => x.id === collabId);
+      if (!c || c.type !== 'emp') return;
+      let pm = 0;
+      const personMap = etpm[collabId];
+      if (personMap && Object.keys(personMap).length) {
+        pm = taskMonths.reduce((s, m) => {
+          const entry = personMap[m];
+          if (!entry || entry.active === false) return s;
+          return s + (parseFloat(entry.rate ?? etp[collabId]) || 0);
+        }, 0);
+      } else {
+        pm = (parseFloat(etp[collabId]) || 0) * duration;
+      }
+      if (!pm) return;
+      if (!empData[collabId]) empData[collabId] = { pm: 0, cost: 0, be_id: c.be_id, label: c.label, salary: c.monthly_salary||0 };
+      empData[collabId].pm += pm;
+      empData[collabId].cost += pm * (c.monthly_salary||0);
+    });
+  });
+
+  // --- Aggregate non-personnel costs from state.costs per BE ---
+  // For each BE that has costs for this WP, sum B, C1, C2, C3, D1, D2
+  const beCosts = {}; // be_id → { B, C1, C2, C3, D1, D2, D3, A_pm, A_cost }
+  (state.beneficiaries||[]).forEach(be => {
+    const key = `${be.id}__${wpId}`;
+    const c = costs[key] || {};
+    const get = (cat) => parseFloat(c[`${cat}_items`]||0) * parseFloat(c[`${cat}_rate`]||0);
+    const B  = get('B1');
+    const C1 = get('C1');
+    const C2 = ['C2_equipment','C2_infra','C2_assets'].reduce((s,cat)=>s+get(cat),0);
+    const C3 = ['C3_consumables','C3_meetings','C3_dissemination','C3_publications','C3_other'].reduce((s,cat)=>s+get(cat),0);
+    const D1 = get('D1'); const D2 = get('D2'); const D3 = get('D3');
+    // Personnel from costs (fallback if no ETP data)
+    const A_from_costs = STAFF_PROFILES.reduce((s,p) => {
+      if (p.fixed_rate) return s;
+      const items = parseFloat(c[`${p.id}_items`]||0);
+      const rate  = parseFloat(c[`${p.id}_rate`]||0);
+      return s + items * rate;
+    }, 0);
+    beCosts[be.id] = { B, C1, C2, C3, D1, D2, D3, A_from_costs,
+      name: be.name || be.id, acronym: be.acronym || be.id };
+  });
+
+  // --- Group empData by BE ---
+  const byBe = {};
+  Object.entries(empData).forEach(([empId, d]) => {
+    if (!byBe[d.be_id]) byBe[d.be_id] = [];
+    byBe[d.be_id].push({ empId, ...d });
+  });
+
+  // If no ETP data but costs exist, show one row per BE using cost data
+  (state.beneficiaries||[]).forEach(be => {
+    if (!byBe[be.id] && (beCosts[be.id]?.A_from_costs || Object.values(beCosts[be.id]||{}).some(v=>v>0))) {
+      byBe[be.id] = [];
+    }
+  });
+
+  if (!Object.keys(byBe).length && !Object.values(beCosts).some(c=>Object.values(c).some(v=>typeof v==='number'&&v>0))) {
+    el.innerHTML = '<div class="empty-state">Saisissez des ETP dans les tâches ou des coûts dans l\'onglet Budget pour pré-remplir ce tableau.</div>';
+    return;
+  }
+
+  // --- Build the HTML table ---
+  const cols = ['A. Personnel','B. Sous-traitance','C.1 Déplacements','C.2 Équipements',
+                'C.3 Autres biens/services','D.1 Soutien financier','D.2 Biens facturés int.','D.3 PAC',
+                'E. Coûts indirects','Total'];
+
+  let html = `<div style="overflow-x:auto"><table class="budget-res-table">
+    <thead>
+      <tr>
+        <th class="brt-participant">Participant</th>
+        <th class="brt-pm">Person-mois</th>
+        ${cols.map(c=>`<th class="brt-cost">${c}</th>`).join('')}
+      </tr>
+    </thead>
+    <tbody>`;
+
+  let totPM = 0, totA = 0, totB = 0, totC1 = 0, totC2 = 0, totC3 = 0,
+      totD1 = 0, totD2 = 0, totD3 = 0, totE = 0, totF = 0;
+
+  (state.beneficiaries||[]).forEach(be => {
+    const emps = byBe[be.id] || [];
+    const bc = beCosts[be.id] || {};
+    const B=bc.B||0, C1=bc.C1||0, C2=bc.C2||0, C3=bc.C3||0, D1=bc.D1||0, D2=bc.D2||0, D3=bc.D3||0;
+
+    if (!emps.length) {
+      // One summary row for BE with costs but no ETP breakdown
+      const A = bc.A_from_costs || 0;
+      if (!A && !B && !C1 && !C2 && !C3 && !D1 && !D2 && !D3) return;
+      const E = (A + C1 + C2 + C3) * 0.25;
+      const F = A + B + C1 + C2 + C3 + D1 + D2 + D3 + E;
+      html += `<tr class="brt-be-row">
+        <td class="brt-participant"><strong>${be.acronym||be.id}</strong><br><small>${be.name||''}</small></td>
+        <td class="brt-pm">–</td>
+        ${[A,B,C1,C2,C3,D1,D2,D3,E,F].map(v=>`<td class="brt-cost">${v>0?fmt(v):'–'}</td>`).join('')}
+      </tr>`;
+      totA+=A; totB+=B; totC1+=C1; totC2+=C2; totC3+=C3; totD1+=D1; totD2+=D2; totD3+=D3; totE+=E; totF+=F;
+      return;
+    }
+
+    // One row per employee
+    emps.forEach((emp, idx) => {
+      const A = emp.cost;
+      // Non-personnel costs prorated to first row only (or could split evenly)
+      const isFirst = idx === 0;
+      const myB = isFirst ? B : 0, myC1 = isFirst ? C1 : 0, myC2 = isFirst ? C2 : 0;
+      const myC3 = isFirst ? C3 : 0, myD1 = isFirst ? D1 : 0;
+      const myD2 = isFirst ? D2 : 0, myD3 = isFirst ? D3 : 0;
+      const myE = (A + myC1 + myC2 + myC3) * 0.25;
+      const myF = A + myB + myC1 + myC2 + myC3 + myD1 + myD2 + myD3 + myE;
+      const nameShort = emp.label.split('(')[0].trim();
+      html += `<tr class="${isFirst ? 'brt-first-row' : 'brt-emp-row'}">
+        <td class="brt-participant">
+          ${isFirst ? `<span class="brt-be-badge">${be.acronym||be.id}</span> ` : ''}
+          ${esc(nameShort)}
+          ${emp.salary ? `<span class="brt-salary">${fmt(emp.salary)}/m</span>` : ''}
+        </td>
+        <td class="brt-pm"><strong>${emp.pm.toFixed(1)}</strong></td>
+        <td class="brt-cost brt-highlight">${A>0?fmt(A):'–'}</td>
+        <td class="brt-cost">${myB>0?fmt(myB):'–'}</td>
+        <td class="brt-cost">${myC1>0?fmt(myC1):'–'}</td>
+        <td class="brt-cost">${myC2>0?fmt(myC2):'–'}</td>
+        <td class="brt-cost">${myC3>0?fmt(myC3):'–'}</td>
+        <td class="brt-cost">${myD1>0?fmt(myD1):'–'}</td>
+        <td class="brt-cost">${myD2>0?fmt(myD2):'–'}</td>
+        <td class="brt-cost">${myD3>0?fmt(myD3):'–'}</td>
+        <td class="brt-cost">${myE>0?fmt(myE):'–'}</td>
+        <td class="brt-cost brt-total">${myF>0?fmt(myF):'–'}</td>
+      </tr>`;
+      totPM+=emp.pm; totA+=A; totB+=myB; totC1+=myC1; totC2+=myC2; totC3+=myC3;
+      totD1+=myD1; totD2+=myD2; totD3+=myD3; totE+=myE; totF+=myF;
+    });
+  });
+
+  // Total row
+  html += `<tr class="brt-total-row">
+    <td class="brt-participant"><strong>TOTAL</strong></td>
+    <td class="brt-pm"><strong>${totPM.toFixed(1)}</strong></td>
+    ${[totA,totB,totC1,totC2,totC3,totD1,totD2,totD3,totE,totF].map(v=>`<td class="brt-cost"><strong>${v>0?fmt(v):'–'}</strong></td>`).join('')}
+  </tr>`;
+
+  html += `</tbody></table></div>`;
+  el.innerHTML = html;
+}
+
+function refreshWPBudgetTable(wpId) {
+  syncWpTasksFromState();
+  renderWPBudgetTable(wpId);
+  showToast('Tableau budget actualisé ✓');
 }
 
 function getAllCollaborators() {
@@ -361,7 +563,7 @@ function getAllCollaborators() {
   return collab;
 }
 
-// Build ETP table for a task: { collabId: months }
+// Build ETP table for a task
 function getTaskEtp(task) {
   return task.etp || {};
 }
@@ -377,12 +579,12 @@ function renderTasks(wpId) {
     const selectedIds = Array.isArray(t.participants_list) ? t.participants_list : [];
     const etp = t.etp || {};
 
-    // Participants + ETP rows inside the cell
-    let participantsHtml = `
+    // --- Participant picker ---
+    const pickerHtml = `
       <div class="participants-picker" id="pp_${wpId}_${i}">
         <div class="pp-trigger" onclick="togglePPDropdown('${wpId}',${i})">
           ${selectedIds.length
-            ? selectedIds.map(id => { const c = collab.find(x => x.id === id); return c ? `<span class="pp-tag">${esc(c.label)}</span>` : ''; }).join('')
+            ? selectedIds.map(id => { const c = collab.find(x=>x.id===id); return c ? `<span class="pp-tag">${esc(c.label.split('(')[0].trim())}</span>` : ''; }).join('')
             : '<span class="pp-placeholder">Cliquer pour sélectionner…</span>'}
         </div>
         <div class="pp-dropdown" id="ppd_${wpId}_${i}">
@@ -394,43 +596,92 @@ function renderTasks(wpId) {
             </label>`).join('')}
           <div class="pp-footer"><button class="btn btn-sm btn-secondary" onclick="closePPDropdown('${wpId}',${i})">✓ Fermer</button></div>
         </div>
-      </div>
-      ${selectedIds.length ? `
-        <div class="etp-grid" id="etp_${wpId}_${i}">
-          <div class="etp-header"><span>Contributeur</span><span>ETP (mois)</span></div>
-          ${selectedIds.map(id => {
-            const c = collab.find(x => x.id === id);
-            if (!c) return '';
-            const etpVal = etp[id] !== undefined ? etp[id] : '';
-            return `<div class="etp-row">
-              <span class="etp-name">${esc(c.label)}</span>
-              <input type="number" min="0" step="0.1" class="etp-input" value="${etpVal}"
-                onchange="setEtp('${wpId}',${i},'${id}',parseFloat(this.value)||0)"
-                oninput="setEtp('${wpId}',${i},'${id}',parseFloat(this.value)||0)"
-                placeholder="0">
-            </div>`;
-          }).join('')}
-          <div class="etp-total">
-            <span>Total ETP :</span>
-            <span id="etp_total_${wpId}_${i}">${selectedIds.reduce((s,id)=>s+(parseFloat(etp[id])||0),0).toFixed(1)} mois</span>
-          </div>
-        </div>` : ''}`;
+      </div>`;
+
+    // --- One row per person ETP table ---
+    let etpTableHtml = '';
+    if (selectedIds.length) {
+      const rows = selectedIds.map(id => {
+        const c = collab.find(x => x.id === id);
+        if (!c) return '';
+        const etpVal = etp[id] !== undefined ? etp[id] : '';
+        const salary = c.monthly_salary || 0;
+        return `<tr class="etpm-row">
+          <td class="etpm-name">
+            <span class="pp-tag" style="max-width:130px;overflow:hidden;text-overflow:ellipsis;display:inline-block">${esc(c.label.split('(')[0].trim())}</span>
+            <div class="etpm-org">${esc(c.label.match(/\(([^)]+)\)/)?.[1]||'')}</div>
+            ${salary ? `<div class="etpm-salary">${fmt(salary)}/mois</div>` : ''}
+          </td>
+          <td class="etpm-etp-cell">
+            <input type="number" min="0" max="1" step="0.05" class="etpm-rate"
+              value="${etpVal}" placeholder="0 – 1"
+              title="ETP : 0 = absent, 0.5 = mi-temps, 1 = plein temps"
+              oninput="setEtp('${wpId}',${i},'${id}',parseFloat(this.value)||0);updateEtpTotal('${wpId}',${i})">
+            <div class="etpm-etp-label">ETP / mois actif</div>
+          </td>
+          <td class="etpm-pm-cell" id="etppm_${wpId}_${i}_${id}">
+            ${renderEtpPmCell(t, id, c)}
+          </td>
+        </tr>`;
+      }).join('');
+
+      // Total row
+      const totalPM = selectedIds.reduce((s, id) => {
+        return s + calcPersonPM(t, id);
+      }, 0);
+
+      etpTableHtml = `
+        <div class="etpm-wrap">
+          <table class="etpm-table">
+            <thead><tr>
+              <th class="etpm-name-th">Contributeur</th>
+              <th class="etpm-etp-th">ETP / mois</th>
+              <th class="etpm-pm-th">Person-mois</th>
+            </tr></thead>
+            <tbody>${rows}</tbody>
+            <tfoot><tr class="etpm-sum-row">
+              <td colspan="2"><strong>Total</strong></td>
+              <td class="etpm-pm-cell" id="etpmtotal_${wpId}_${i}">
+                <strong>${totalPM.toFixed(1)}</strong> <small>PM</small>
+              </td>
+            </tr></tfoot>
+          </table>
+        </div>`;
+    }
 
     return `<tr>
       <td style="white-space:nowrap;vertical-align:top;padding-top:.6rem">
-        <input type="text" value="${esc(t.num||'')}" onchange="wpTasks['${wpId}'][${i}].num=this.value" placeholder="T${wpId.replace('WP','')}.${i+1}" style="width:72px">
+        <input type="text" value="${esc(t.num||'')}" onchange="wpTasks['${wpId}'][${i}].num=this.value;autoSaveTasks('${wpId}')" placeholder="T${wpId.replace('WP','')}.${i+1}" style="width:72px">
       </td>
       <td style="vertical-align:top">
-        <input type="text" value="${esc(t.name||'')}" onchange="wpTasks['${wpId}'][${i}].name=this.value">
-        <textarea rows="2" style="margin-top:.25rem" onchange="wpTasks['${wpId}'][${i}].description=this.value">${esc(t.description||'')}</textarea>
+        <input type="text" value="${esc(t.name||'')}" onchange="wpTasks['${wpId}'][${i}].name=this.value;autoSaveTasks('${wpId}')">
+        <textarea rows="2" style="margin-top:.25rem" onchange="wpTasks['${wpId}'][${i}].description=this.value;autoSaveTasks('${wpId}')">${esc(t.description||'')}</textarea>
       </td>
-      <td style="position:relative;min-width:260px;vertical-align:top">${participantsHtml}</td>
+      <td style="position:relative;min-width:280px;vertical-align:top">
+        ${pickerHtml}
+        ${etpTableHtml}
+      </td>
       <td style="vertical-align:top;white-space:nowrap">
-        <input type="text" value="${esc(t.subcontracting||'')}" onchange="wpTasks['${wpId}'][${i}].subcontracting=this.value" placeholder="Oui/Non" style="width:80px">
+        <input type="text" value="${esc(t.subcontracting||'')}" onchange="wpTasks['${wpId}'][${i}].subcontracting=this.value;autoSaveTasks('${wpId}')" placeholder="Oui/Non" style="width:80px">
       </td>
       <td style="vertical-align:top"><button class="btn btn-sm btn-danger" onclick="wpTasks['${wpId}'].splice(${i},1);renderTasks('${wpId}')">🗑️</button></td>
     </tr>`;
   }).join('');
+}
+
+function calcPersonPM(task, id) {
+  const dur = (task.months||[]).length;
+  const rate = parseFloat((task.etp||{})[id]) || 0;
+  return dur * rate;
+}
+
+function renderEtpPmCell(task, id, c) {
+  const pm = calcPersonPM(task, id);
+  const cost = c.monthly_salary && pm ? fmt(pm * c.monthly_salary) : '';
+  const dur = (task.months||[]).length;
+  return pm > 0
+    ? `<strong>${pm.toFixed(1)}</strong> <small>PM</small>${dur ? `<div class="etpm-dur">${dur} mois × ${(task.etp?.[id]||0)}</div>` : ''}${cost ? `<div class="etpm-cost">${cost}</div>` : ''}`
+    : `<span style="color:var(--text-muted)">—</span>${dur ? `<div class="etpm-dur">${dur} mois</div>` : ''}`;
 }
 
 function setEtp(wpId, taskIdx, collabId, val) {
@@ -438,18 +689,24 @@ function setEtp(wpId, taskIdx, collabId, val) {
   if (!task) return;
   if (!task.etp) task.etp = {};
   task.etp[collabId] = val;
-  // Update total display
-  const totalEl = document.getElementById(`etp_total_${wpId}_${taskIdx}`);
-  if (totalEl) {
-    const sel = task.participants_list || [];
-    const total = sel.reduce((s, id) => s + (parseFloat(task.etp[id])||0), 0);
-    totalEl.textContent = total.toFixed(1) + ' mois';
-  }
+  // Update the PM cell for this person inline
+  const collab = getAllCollaborators();
+  const c = collab.find(x => x.id === collabId);
+  const el = document.getElementById(`etppm_${wpId}_${taskIdx}_${collabId}`);
+  if (el && c) el.innerHTML = renderEtpPmCell(task, collabId, c);
+}
+
+function updateEtpTotal(wpId, taskIdx) {
+  const task = (wpTasks[wpId]||[])[taskIdx];
+  if (!task) return;
+  const totalPM = (task.participants_list||[]).reduce((s, id) => s + calcPersonPM(task, id), 0);
+  const el = document.getElementById(`etpmtotal_${wpId}_${taskIdx}`);
+  if (el) el.innerHTML = `<strong>${totalPM.toFixed(1)}</strong> <small>PM</small>`;
 }
 
 function addTask(wpId) {
   wpTasks[wpId] = wpTasks[wpId] || [];
-  wpTasks[wpId].push({ num:'', name:'', description:'', participants_list:[], etp:{}, subcontracting:'' });
+  wpTasks[wpId].push({ num:'', name:'', description:'', participants_list:[], etp:{}, months:[], subcontracting:'' });
   renderTasks(wpId);
 }
 
@@ -498,45 +755,52 @@ document.addEventListener('click', e => {
 
 // ---- ETP → BUDGET: compute aggregated ETP per profile per BE×WP ----
 function computeEtpForBudget(beId, wpId) {
-  // Returns { catId: { total_pm, emp_id, monthly_salary } }
-  // Aggregates all tasks across all WPs for this BE×WP pair
   const collab = getAllCollaborators();
-  const allTasks = state.tasks || {};
-  // Only tasks of this WP
-  const tasks = allTasks[wpId] || [];
-
-  // Map: empId → { total_pm }
+  const tasks = (state.tasks && state.tasks[wpId]) || [];
+  const wp = (state.work_packages||[]).find(w => w.id === wpId);
+  const wpDuration = wp ? ((wp.end_month||24) - (wp.start_month||1) + 1) : 24;
   const empPM = {};
+
   tasks.forEach(task => {
-    const sel = Array.isArray(task.participants_list) ? task.participants_list : [];
+    const taskMonths = task.months || [];
+    // Fallback: if no Gantt months set, use full WP duration
+    const duration = taskMonths.length > 0 ? taskMonths.length : wpDuration;
     const etp = task.etp || {};
-    sel.forEach(collabId => {
+    const etpm = task.etp_months || {};
+    (task.participants_list||[]).forEach(collabId => {
       const c = collab.find(x => x.id === collabId);
-      if (!c || c.be_id !== beId) return; // only this BE
-      if (c.type !== 'emp') return; // only named employees
-      const pm = parseFloat(etp[collabId]) || 0;
+      if (!c || c.be_id !== beId || c.type !== 'emp') return;
+      let pm = 0;
+      const personMap = etpm[collabId];
+      if (personMap && Object.keys(personMap).length) {
+        pm = taskMonths.reduce((s, m) => {
+          const entry = personMap[m];
+          if (!entry || entry.active === false) return s;
+          return s + (parseFloat(entry.rate ?? etp[collabId]) || 0);
+        }, 0);
+      } else {
+        // etp_rate × duration (Gantt months if set, else WP duration)
+        pm = (parseFloat(etp[collabId]) || 0) * duration;
+      }
+      if (!pm) return;
       if (!empPM[collabId]) empPM[collabId] = { total_pm: 0, emp: c };
       empPM[collabId].total_pm += pm;
     });
   });
 
-  // Map: catId (A1_senior etc) → { total_pm, best_emp_id, monthly_salary }
   const catAgg = {};
   Object.entries(empPM).forEach(([empId, data]) => {
-    const catId = data.emp.profile; // e.g. "A1_senior"
+    const catId = data.emp.profile;
     if (!catId) return;
     if (!catAgg[catId]) catAgg[catId] = { total_pm: 0, emp_ids: [], monthly_salaries: [] };
     catAgg[catId].total_pm += data.total_pm;
     catAgg[catId].emp_ids.push(empId);
     catAgg[catId].monthly_salaries.push(data.emp.monthly_salary || 0);
   });
-
-  // Compute average salary per category
   Object.keys(catAgg).forEach(catId => {
-    const salaries = catAgg[catId].monthly_salaries.filter(s => s > 0);
-    catAgg[catId].avg_salary = salaries.length ? salaries.reduce((a,b)=>a+b,0)/salaries.length : 0;
+    const sal = catAgg[catId].monthly_salaries.filter(s => s > 0);
+    catAgg[catId].avg_salary = sal.length ? sal.reduce((a,b)=>a+b,0)/sal.length : 0;
   });
-
   return catAgg;
 }
 
@@ -572,7 +836,14 @@ async function saveTasks(wpId) {
   await post(`/api/tasks/${wpId}`,{tasks:wpTasks[wpId]||[]});
   if(!state.tasks) state.tasks={};
   state.tasks[wpId]=[...(wpTasks[wpId]||[])];
+  renderWPBudgetTable(wpId); // refresh budget table
   showToast('Tâches enregistrées ✓');
+}
+
+const _autoSaveTaskTimers = {};
+function autoSaveTasks(wpId) {
+  clearTimeout(_autoSaveTaskTimers[wpId]);
+  _autoSaveTaskTimers[wpId] = setTimeout(() => saveTasks(wpId), 800);
 }
 
 function renderMilestones(wpId) {
@@ -581,12 +852,12 @@ function renderMilestones(wpId) {
   const ms=wpMilestones[wpId]||[];
   if(!ms.length){tbody.innerHTML='<tr><td colspan="7" class="empty-state">Aucun jalon.</td></tr>';return;}
   tbody.innerHTML=ms.map((m,i)=>`<tr>
-    <td><input type="text" value="${esc(m.num||`MS${i+1}`)}" onchange="wpMilestones['${wpId}'][${i}].num=this.value"></td>
-    <td><input type="text" value="${esc(m.name||'')}" onchange="wpMilestones['${wpId}'][${i}].name=this.value"></td>
-    <td><input type="text" value="${esc(m.lead||'')}" onchange="wpMilestones['${wpId}'][${i}].lead=this.value"></td>
-    <td><input type="text" value="${esc(m.description||'')}" onchange="wpMilestones['${wpId}'][${i}].description=this.value"></td>
-    <td><input type="number" value="${m.due_month||''}" min="1" onchange="wpMilestones['${wpId}'][${i}].due_month=parseInt(this.value)"></td>
-    <td><input type="text" value="${esc(m.verification||'')}" onchange="wpMilestones['${wpId}'][${i}].verification=this.value"></td>
+    <td><input type="text" value="${esc(m.num||`MS${i+1}`)}" onchange="wpMilestones['${wpId}'][${i}].num=this.value;autoSaveMilestones('${wpId}')"></td>
+    <td><input type="text" value="${esc(m.name||'')}" onchange="wpMilestones['${wpId}'][${i}].name=this.value;autoSaveMilestones('${wpId}')"></td>
+    <td><input type="text" value="${esc(m.lead||'')}" onchange="wpMilestones['${wpId}'][${i}].lead=this.value;autoSaveMilestones('${wpId}')"></td>
+    <td><input type="text" value="${esc(m.description||'')}" onchange="wpMilestones['${wpId}'][${i}].description=this.value;autoSaveMilestones('${wpId}')"></td>
+    <td><input type="number" value="${m.due_month||''}" min="1" onchange="wpMilestones['${wpId}'][${i}].due_month=parseInt(this.value);autoSaveMilestones('${wpId}')"></td>
+    <td><input type="text" value="${esc(m.verification||'')}" onchange="wpMilestones['${wpId}'][${i}].verification=this.value;autoSaveMilestones('${wpId}')"></td>
     <td><button class="btn btn-sm btn-danger" onclick="wpMilestones['${wpId}'].splice(${i},1);renderMilestones('${wpId}')">🗑️</button></td>
   </tr>`).join('');
 }
@@ -600,6 +871,12 @@ async function saveMilestones(wpId) {
   showToast('Jalons enregistrés ✓');
 }
 
+const _autoSaveMsTimers = {};
+function autoSaveMilestones(wpId) {
+  clearTimeout(_autoSaveMsTimers[wpId]);
+  _autoSaveMsTimers[wpId] = setTimeout(() => saveMilestones(wpId), 800);
+}
+
 const DELIVERABLE_TYPES=['R — Document, report','DEM — Demonstrator, pilot, prototype','DEC — Websites, patent, videos','DATA — data sets','DMP — Data Management Plan','ETHICS','SECURITY','OTHER'];
 const DISSEMINATION_LEVELS=['PU — Public','SEN — Sensitive','R-UE/EU-R — EU Classified'];
 
@@ -611,13 +888,13 @@ function renderDeliverables(wpId) {
   const typeOpts=DELIVERABLE_TYPES.map(t=>`<option>${t}</option>`).join('');
   const dissOpts=DISSEMINATION_LEVELS.map(d=>`<option>${d}</option>`).join('');
   tbody.innerHTML=ds.map((d,i)=>`<tr>
-    <td><input type="text" value="${esc(d.num||`D${i+1}`)}" onchange="wpDeliverables['${wpId}'][${i}].num=this.value"></td>
-    <td><input type="text" value="${esc(d.name||'')}" onchange="wpDeliverables['${wpId}'][${i}].name=this.value"></td>
-    <td><input type="text" value="${esc(d.lead||'')}" onchange="wpDeliverables['${wpId}'][${i}].lead=this.value"></td>
-    <td><select onchange="wpDeliverables['${wpId}'][${i}].type=this.value">${DELIVERABLE_TYPES.map(t=>`<option ${d.type===t?'selected':''}>${t}</option>`).join('')}</select></td>
-    <td><select onchange="wpDeliverables['${wpId}'][${i}].dissemination=this.value">${DISSEMINATION_LEVELS.map(dl=>`<option ${d.dissemination===dl?'selected':''}>${dl}</option>`).join('')}</select></td>
-    <td><input type="number" value="${d.due_month||''}" min="1" onchange="wpDeliverables['${wpId}'][${i}].due_month=parseInt(this.value)"></td>
-    <td><textarea rows="2" onchange="wpDeliverables['${wpId}'][${i}].description=this.value">${esc(d.description||'')}</textarea></td>
+    <td><input type="text" value="${esc(d.num||`D${i+1}`)}" onchange="wpDeliverables['${wpId}'][${i}].num=this.value;autoSaveDeliverables('${wpId}')"></td>
+    <td><input type="text" value="${esc(d.name||'')}" onchange="wpDeliverables['${wpId}'][${i}].name=this.value;autoSaveDeliverables('${wpId}')"></td>
+    <td><input type="text" value="${esc(d.lead||'')}" onchange="wpDeliverables['${wpId}'][${i}].lead=this.value;autoSaveDeliverables('${wpId}')"></td>
+    <td><select onchange="wpDeliverables['${wpId}'][${i}].type=this.value;autoSaveDeliverables('${wpId}')">${DELIVERABLE_TYPES.map(t=>`<option ${d.type===t?'selected':''}>${t}</option>`).join('')}</select></td>
+    <td><select onchange="wpDeliverables['${wpId}'][${i}].dissemination=this.value;autoSaveDeliverables('${wpId}')">${DISSEMINATION_LEVELS.map(dl=>`<option ${d.dissemination===dl?'selected':''}>${dl}</option>`).join('')}</select></td>
+    <td><input type="number" value="${d.due_month||''}" min="1" onchange="wpDeliverables['${wpId}'][${i}].due_month=parseInt(this.value);autoSaveDeliverables('${wpId}')"></td>
+    <td><textarea rows="2" onchange="wpDeliverables['${wpId}'][${i}].description=this.value;autoSaveDeliverables('${wpId}')">${esc(d.description||'')}</textarea></td>
     <td><button class="btn btn-sm btn-danger" onclick="wpDeliverables['${wpId}'].splice(${i},1);renderDeliverables('${wpId}')">🗑️</button></td>
   </tr>`).join('');
 }
@@ -629,6 +906,12 @@ async function saveDeliverables(wpId) {
   if(!state.deliverables) state.deliverables={};
   state.deliverables[wpId]=[...(wpDeliverables[wpId]||[])];
   showToast('Livrables enregistrés ✓');
+}
+
+const _autoSaveDelTimers = {};
+function autoSaveDeliverables(wpId) {
+  clearTimeout(_autoSaveDelTimers[wpId]);
+  _autoSaveDelTimers[wpId] = setTimeout(() => saveDeliverables(wpId), 800);
 }
 
 // ---- COSTS ----
@@ -788,7 +1071,187 @@ async function saveCosts(beId,wpId) {
   showToast('Coûts enregistrés ✓');
 }
 
-// ---- RISKS ----
+// ---- STAFF TABLE (Part B) — synced from employees ----
+let localStaff=[];
+function renderStaffTable(){
+  const pb=state.part_b||{};
+  localStaff=[...(pb.staff_table||[])];
+  _renderStaff();
+}
+function _renderStaff(){
+  const tbody=document.getElementById('staff-tbody');
+  if(!tbody) return;
+  if(!localStaff.length){tbody.innerHTML='<tr><td colspan="4" class="empty-state">Aucun membre. Utilisez « Sync » ou ajoutez manuellement.</td></tr>';return;}
+  tbody.innerHTML=localStaff.map((s,i)=>`<tr>
+    <td><input type="text" value="${esc(s.name_function||'')}" onchange="localStaff[${i}].name_function=this.value;saveStaff()" placeholder="Prénom NOM – Fonction"></td>
+    <td><input type="text" value="${esc(s.organisation||'')}" onchange="localStaff[${i}].organisation=this.value;saveStaff()"></td>
+    <td><textarea rows="2" onchange="localStaff[${i}].role=this.value;saveStaff()">${esc(s.role||'')}</textarea></td>
+    <td><button class="btn btn-sm btn-danger" onclick="localStaff.splice(${i},1);_renderStaff();saveStaff()">🗑️</button></td>
+  </tr>`).join('');
+}
+function addStaffRow(){localStaff.push({name_function:'',organisation:'',role:''});_renderStaff();}
+async function saveStaff(){
+  await post('/api/part_b',{staff_table:localStaff});
+  if(!state.part_b) state.part_b={};
+  state.part_b.staff_table=[...localStaff];
+}
+
+async function syncStaffFromEmployees(){
+  const newRows = [];
+  (state.beneficiaries||[]).forEach(be => {
+    const beEmps = (state.employees&&state.employees[be.id])||[];
+    beEmps.forEach(emp => {
+      const name = [emp.last_name, emp.first_name].filter(Boolean).join(' ');
+      const prof = STAFF_PROFILES.find(p=>p.id===emp.profile);
+      newRows.push({
+        name_function: name + (prof ? ` — ${prof.label}` : ''),
+        organisation: be.name || be.id,
+        role: emp.note || prof?.label || ''
+      });
+    });
+  });
+  if(!newRows.length){ showToast('Aucun employé trouvé. Ajoutez-en dans l\'onglet Bénéficiaires.'); return; }
+  // Merge: keep manual rows not matching any employee, prepend synced rows
+  const existingManual = localStaff.filter(s => !s._synced);
+  localStaff = newRows.map(r=>({...r, _synced:true})).concat(existingManual);
+  _renderStaff();
+  await saveStaff();
+  showToast(`${newRows.length} membre(s) importé(s) depuis Équipe & Salaires ✓`);
+}
+
+// ---- ETP VERIFICATION ----
+function runEtpVerification(){
+  const container = document.getElementById('verification-container');
+  if(!container) return;
+  const collab = getAllCollaborators();
+  const dur = parseInt(state.project_duration_months)||24;
+  const months = Array.from({length:dur},(_,i)=>i+1);
+
+  // Build: empId → month → total ETP (across all tasks all WPs)
+  const empMonthEtp = {}; // { empId: { month: totalEtp } }
+
+  (state.work_packages||[]).forEach(wp => {
+    const tasks = Object.values(wpTasks).find((_,idx)=>Object.keys(wpTasks)[idx]===wp.id) 
+      || (state.tasks&&state.tasks[wp.id]) || [];
+    (Array.isArray(tasks)?tasks:[]).forEach(task => {
+      const taskMonths = task.months||[];
+      const etp = task.etp||{};
+      const etpm = task.etp_months||{};
+      (task.participants_list||[]).forEach(collabId => {
+        const c = collab.find(x=>x.id===collabId);
+        if(!c||c.type!=='emp') return;
+        if(!empMonthEtp[collabId]) empMonthEtp[collabId]={};
+        taskMonths.forEach(m => {
+          const personMap = etpm[collabId];
+          let rate = 0;
+          if(personMap && personMap[m] !== undefined){
+            if(personMap[m].active===false) return;
+            rate = parseFloat(personMap[m].rate ?? etp[collabId]) || 0;
+          } else {
+            rate = parseFloat(etp[collabId]) || 0;
+          }
+          if(!rate) return;
+          empMonthEtp[collabId][m] = (empMonthEtp[collabId][m]||0) + rate;
+        });
+      });
+    });
+  });
+
+  if(!Object.keys(empMonthEtp).length){
+    container.innerHTML='<div class="empty-state">Aucun ETP trouvé. Remplissez les ETP dans les tâches des WP.</div>';
+    return;
+  }
+
+  // Analyse per person
+  let hasErrors = false;
+  let html = '';
+
+  Object.entries(empMonthEtp).forEach(([empId, monthMap]) => {
+    const c = collab.find(x=>x.id===empId);
+    if(!c) return;
+    const be = (state.beneficiaries||[]).find(b=>b.id===c.be_id);
+
+    const overloaded = []; // months > 1.0
+    const activeMonths = Object.entries(monthMap).map(([m,v])=>({m:parseInt(m),v})).sort((a,b)=>a.m-b.m);
+    const maxEtp = activeMonths.reduce((mx,x)=>Math.max(mx,x.v),0);
+    const totalPM = activeMonths.reduce((s,x)=>s+x.v,0);
+
+    activeMonths.forEach(({m,v}) => { if(v > 1.001) overloaded.push({m,v}); });
+
+    const status = overloaded.length > 0 ? 'error' : maxEtp > 0.9 ? 'warning' : 'ok';
+    if(status==='error') hasErrors = true;
+
+    const statusIcon = status==='error' ? '🔴' : status==='warning' ? '🟡' : '🟢';
+    const statusLabel = status==='error' ? 'SURCHARGE' : status==='warning' ? 'Proche de 1.0' : 'OK';
+
+    // Build the monthly bar
+    const barCells = months.map(m => {
+      const v = monthMap[m] || 0;
+      if(!v) return `<td class="vtbl-cell vtbl-empty" title="M${m}: 0">—</td>`;
+      const pct = Math.min(v/1, 1)*100;
+      const color = v > 1.001 ? '#dc2626' : v > 0.85 ? '#f59e0b' : '#16a34a';
+      return `<td class="vtbl-cell" title="M${m}: ${v.toFixed(2)} ETP">
+        <div class="vtbl-bar-wrap">
+          <div class="vtbl-bar" style="height:${pct}%;background:${color}"></div>
+        </div>
+        <div class="vtbl-val" style="color:${color}">${v.toFixed(1)}</div>
+      </td>`;
+    }).join('');
+
+    html += `<div class="vcheck-card ${status}">
+      <div class="vcheck-header">
+        <div>
+          <span class="vcheck-icon">${statusIcon}</span>
+          <strong>${esc(c.label.split('(')[0].trim())}</strong>
+          <span class="vcheck-be">${be?.name||c.be_id}</span>
+          ${overloaded.length ? `<span class="vcheck-badge error">⚠️ ${overloaded.length} mois en surcharge</span>` : ''}
+        </div>
+        <div class="vcheck-stats">
+          <span>Total : <strong>${totalPM.toFixed(1)} PM</strong></span>
+          <span>Max/mois : <strong style="color:${maxEtp>1?'#dc2626':maxEtp>0.85?'#f59e0b':'#16a34a'}">${maxEtp.toFixed(2)}</strong></span>
+          <span class="vcheck-status-badge ${status}">${statusLabel}</span>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="vtbl">
+          <thead><tr>
+            <th class="vtbl-name-th">Mois</th>
+            ${months.map(m=>`<th class="vtbl-mth-th">M${m}</th>`).join('')}
+          </thead>
+          <tbody><tr>
+            <td class="vtbl-row-label">ETP</td>
+            ${barCells}
+          </tr></tbody>
+        </table>
+      </div>
+      ${overloaded.length ? `<div class="vcheck-detail">
+        ⚠️ Surcharges détectées : ${overloaded.map(x=>`<strong>M${x.m} = ${x.v.toFixed(2)}</strong>`).join(', ')}
+      </div>` : ''}
+    </div>`;
+  });
+
+  // Summary header
+  const total = Object.keys(empMonthEtp).length;
+  const errors = Object.values(empMonthEtp).filter(mm => Object.values(mm).some(v=>v>1.001)).length;
+  const warnings = Object.values(empMonthEtp).filter(mm => !Object.values(mm).some(v=>v>1.001) && Object.values(mm).some(v=>v>0.85)).length;
+
+  const summaryHtml = `<div class="vcheck-summary">
+    <div class="vcheck-sum-item ${errors?'error':'ok'}">
+      <span class="vcheck-sum-icon">${errors?'🔴':'🟢'}</span>
+      <strong>${errors}</strong> personne(s) en surcharge (&gt; 1.0 ETP)
+    </div>
+    <div class="vcheck-sum-item ${warnings?'warn':'ok'}">
+      <span class="vcheck-sum-icon">${warnings?'🟡':'🟢'}</span>
+      <strong>${warnings}</strong> personne(s) proche du maximum (&gt; 0.85 ETP)
+    </div>
+    <div class="vcheck-sum-item ok">
+      <span class="vcheck-sum-icon">👥</span>
+      <strong>${total}</strong> personne(s) analysée(s)
+    </div>
+  </div>`;
+
+  container.innerHTML = summaryHtml + html;
+}
 let localRisks=[];
 function renderRisks(){
   const pb=state.part_b||{};
@@ -802,13 +1265,13 @@ function _renderRisksTable(){
   const wpOpts=(state.work_packages||[]).map(w=>`<option value="${w.id}">${w.id}</option>`).join('');
   tbody.innerHTML=localRisks.map((r,i)=>`<tr>
     <td>${i+1}</td>
-    <td><textarea rows="2" onchange="localRisks[${i}].description=this.value">${esc(r.description||'')}</textarea></td>
-    <td><select onchange="localRisks[${i}].wp=this.value"><option value="">–</option>${wpOpts}</select></td>
-    <td><textarea rows="2" onchange="localRisks[${i}].mitigation=this.value">${esc(r.mitigation||'')}</textarea></td>
-    <td><select onchange="localRisks[${i}].impact=this.value">
+    <td><textarea rows="2" onchange="localRisks[${i}].description=this.value;saveRisks()">${esc(r.description||'')}</textarea></td>
+    <td><select onchange="localRisks[${i}].wp=this.value;saveRisks()"><option value="">–</option>${wpOpts.replace(`value="${r.wp}"`,`value="${r.wp}" selected`)}</select></td>
+    <td><textarea rows="2" onchange="localRisks[${i}].mitigation=this.value;saveRisks()">${esc(r.mitigation||'')}</textarea></td>
+    <td><select onchange="localRisks[${i}].impact=this.value;saveRisks()">
       ${['Faible','Moyen','Élevé'].map(l=>`<option ${r.impact===l?'selected':''}>${l}</option>`).join('')}
     </select></td>
-    <td><select onchange="localRisks[${i}].probability=this.value">
+    <td><select onchange="localRisks[${i}].probability=this.value;saveRisks()">
       ${['Faible','Moyenne','Élevée'].map(l=>`<option ${r.probability===l?'selected':''}>${l}</option>`).join('')}
     </select></td>
     <td><button class="btn btn-sm btn-danger" onclick="localRisks.splice(${i},1);_renderRisksTable();saveRisks()">🗑️</button></td>
@@ -819,31 +1282,6 @@ async function saveRisks(){
   await post('/api/part_b',{risks:localRisks});
   if(!state.part_b) state.part_b={};
   state.part_b.risks=[...localRisks];
-}
-
-// ---- STAFF TABLE ----
-let localStaff=[];
-function renderStaffTable(){
-  const pb=state.part_b||{};
-  localStaff=[...(pb.staff_table||[])];
-  _renderStaff();
-}
-function _renderStaff(){
-  const tbody=document.getElementById('staff-tbody');
-  if(!tbody) return;
-  if(!localStaff.length){tbody.innerHTML='<tr><td colspan="4" class="empty-state">Aucun membre.</td></tr>';return;}
-  tbody.innerHTML=localStaff.map((s,i)=>`<tr>
-    <td><input type="text" value="${esc(s.name_function||'')}" onchange="localStaff[${i}].name_function=this.value" placeholder="Prénom NOM – Fonction"></td>
-    <td><input type="text" value="${esc(s.organisation||'')}" onchange="localStaff[${i}].organisation=this.value"></td>
-    <td><textarea rows="2" onchange="localStaff[${i}].role=this.value">${esc(s.role||'')}</textarea></td>
-    <td><button class="btn btn-sm btn-danger" onclick="localStaff.splice(${i},1);_renderStaff();saveStaff()">🗑️</button></td>
-  </tr>`).join('');
-}
-function addStaffRow(){localStaff.push({name_function:'',organisation:'',role:''});_renderStaff();}
-async function saveStaff(){
-  await post('/api/part_b',{staff_table:localStaff});
-  if(!state.part_b) state.part_b={};
-  state.part_b.staff_table=[...localStaff];
 }
 
 // ---- SUBCONTRACTING ----
@@ -858,13 +1296,13 @@ function _renderSubTable(){
   if(!localSubcontracting.length){tbody.innerHTML='<tr><td colspan="8" class="empty-state">Aucune sous-traitance.</td></tr>';return;}
   const wpOpts=(state.work_packages||[]).map(w=>`<option value="${w.id}">${w.id}</option>`).join('');
   tbody.innerHTML=localSubcontracting.map((s,i)=>`<tr>
-    <td><select onchange="localSubcontracting[${i}].wp=this.value"><option>–</option>${wpOpts}</select></td>
-    <td><input type="text" value="${esc(s.num||`S${i+1}`)}" onchange="localSubcontracting[${i}].num=this.value"></td>
-    <td><input type="text" value="${esc(s.name||'')}" onchange="localSubcontracting[${i}].name=this.value"></td>
-    <td><textarea rows="2" onchange="localSubcontracting[${i}].description=this.value">${esc(s.description||'')}</textarea></td>
-    <td><input type="number" value="${s.cost||''}" onchange="localSubcontracting[${i}].cost=parseFloat(this.value)"></td>
-    <td><textarea rows="2" onchange="localSubcontracting[${i}].justification=this.value">${esc(s.justification||'')}</textarea></td>
-    <td><textarea rows="2" onchange="localSubcontracting[${i}].best_value=this.value">${esc(s.best_value||'')}</textarea></td>
+    <td><select onchange="localSubcontracting[${i}].wp=this.value;debouncedSave('subcontracting', saveSubcontracting)"><option>–</option>${wpOpts}</select></td>
+    <td><input type="text" value="${esc(s.num||`S${i+1}`)}" onchange="localSubcontracting[${i}].num=this.value;debouncedSave('subcontracting', saveSubcontracting)"></td>
+    <td><input type="text" value="${esc(s.name||'')}" onchange="localSubcontracting[${i}].name=this.value;debouncedSave('subcontracting', saveSubcontracting)"></td>
+    <td><textarea rows="2" onchange="localSubcontracting[${i}].description=this.value;debouncedSave('subcontracting', saveSubcontracting)">${esc(s.description||'')}</textarea></td>
+    <td><input type="number" value="${s.cost||''}" onchange="localSubcontracting[${i}].cost=parseFloat(this.value);debouncedSave('subcontracting', saveSubcontracting)"></td>
+    <td><textarea rows="2" onchange="localSubcontracting[${i}].justification=this.value;debouncedSave('subcontracting', saveSubcontracting)">${esc(s.justification||'')}</textarea></td>
+    <td><textarea rows="2" onchange="localSubcontracting[${i}].best_value=this.value;debouncedSave('subcontracting', saveSubcontracting)">${esc(s.best_value||'')}</textarea></td>
     <td><button class="btn btn-sm btn-danger" onclick="localSubcontracting.splice(${i},1);_renderSubTable()">🗑️</button></td>
   </tr>`).join('');
 }
@@ -886,7 +1324,34 @@ function populateGanttWPSelect() {
     (state.work_packages||[]).map(w => `<option value="${w.id}" ${w.id===cur?'selected':''}>${w.id} – ${w.name}</option>`).join('');
 }
 
+// Track which WPs have been locally modified (not yet saved)
+const _wpTasksDirty = new Set();
+
+function syncWpTasksFromState() {
+  // Only sync WPs that haven't been locally modified since last save
+  (state.work_packages||[]).forEach(wp => {
+    if (!_wpTasksDirty.has(wp.id) && state.tasks?.[wp.id]) {
+      wpTasks[wp.id] = JSON.parse(JSON.stringify(state.tasks[wp.id]));
+    }
+  });
+  // Remove WPs that no longer exist
+  Object.keys(wpTasks).forEach(wpId => {
+    if (!(state.work_packages||[]).find(w => w.id === wpId)) {
+      delete wpTasks[wpId];
+      _wpTasksDirty.delete(wpId);
+    }
+  });
+}
+
+function resetWpTasksCache() {
+  // Called on session load - clear everything and re-sync from fresh state
+  Object.keys(wpTasks).forEach(k => delete wpTasks[k]);
+  _wpTasksDirty.clear();
+  syncWpTasksFromState();
+}
+
 function renderGantt() {
+  syncWpTasksFromState();  // ensure wpTasks mirrors state before render
   populateGanttWPSelect();
   const container = document.getElementById('gantt-container');
   if (!container) return;
@@ -991,10 +1456,10 @@ function renderGantt() {
 
 function ganttMouseDown(key, wpId, taskIdx, month, event) {
   event.preventDefault();
-  const task = wpTasks[wpId]?.[taskIdx] || (state.tasks?.[wpId]?.[taskIdx]);
-  if (!task) return;
+  // Always use the freshest data (wpTasks already synced by renderGantt)
   if (!wpTasks[wpId]) wpTasks[wpId] = JSON.parse(JSON.stringify(state.tasks?.[wpId] || []));
   const t = wpTasks[wpId][taskIdx];
+  if (!t) return;
   if (!t.months) t.months = [];
   const currentlyActive = t.months.includes(month);
   ganttDrag = { active: true, key, wpId, taskIdx, startMonth: month, painting: !currentlyActive };
@@ -1007,15 +1472,39 @@ function ganttMouseEnter(key, wpId, taskIdx, month) {
   ganttToggleMonth(wpId, taskIdx, month, ganttDrag.painting);
 }
 
+let _ganttSaveTimer = null;
 function ganttMouseUp() {
   if (ganttDrag.active) {
     ganttDrag.active = false;
     renderGanttEtpSummary();
+    // Auto-save after interaction — debounced 1s
+    clearTimeout(_ganttSaveTimer);
+    _ganttSaveTimer = setTimeout(async () => {
+      const saves = Object.entries(wpTasks).map(([wpId, tasks]) =>
+        post(`/api/tasks/${wpId}`, {tasks}).then(() => {
+          if (!state.tasks) state.tasks = {};
+          state.tasks[wpId] = JSON.parse(JSON.stringify(tasks));
+          _wpTasksDirty.delete(wpId);
+        })
+      );
+      await Promise.all(saves);
+      // Brief visual feedback on the save button
+      const btn = document.querySelector('[onclick="saveGantt()"]');
+      if (btn) {
+        btn.style.background = 'var(--success)';
+        btn.style.color = '#fff';
+        setTimeout(() => { btn.style.background = ''; btn.style.color = ''; }, 1200);
+      }
+    }, 1000);
   }
 }
 
 function ganttToggleMonth(wpId, taskIdx, month, active) {
-  if (!wpTasks[wpId]) wpTasks[wpId] = JSON.parse(JSON.stringify(state.tasks?.[wpId] || []));
+  // Ensure wpTasks is populated from state before modifying
+  if (!wpTasks[wpId]) {
+    wpTasks[wpId] = JSON.parse(JSON.stringify(state.tasks?.[wpId] || []));
+  }
+  _wpTasksDirty.add(wpId); // mark as locally modified
   const t = wpTasks[wpId][taskIdx];
   if (!t) return;
   if (!t.months) t.months = [];
@@ -1038,30 +1527,35 @@ function renderGanttEtpSummary() {
   const el = document.getElementById('gantt-etp-summary');
   if (!el) return;
   const collab = getAllCollaborators();
-
-  // Aggregate: per BE × WP → per empId → total person-months from months
-  // Person-months = etp_monthly_rate × months_active
-  const summary = {}; // key: beId__wpId → { catId → { pm, salary, emp_ids } }
+  const summary = {};
 
   (state.work_packages||[]).forEach(wp => {
     const tasks = wpTasks[wp.id] || state.tasks?.[wp.id] || [];
     tasks.forEach(task => {
-      const dur = (task.months||[]).length;
-      if (!dur) return;
+      const taskMonths = task.months || [];
+      const etp = task.etp || {};
+      const etpm = task.etp_months || {};
       (task.participants_list||[]).forEach(collabId => {
         const c = collab.find(x => x.id === collabId);
         if (!c || c.type !== 'emp') return;
-        const etpRate = parseFloat(task.etp?.[collabId]) || 0; // person-months per month of task
-        if (!etpRate) return;
-        const pm = etpRate * dur; // total person-months for this task
-        const beId = c.be_id;
-        const k = `${beId}__${wp.id}`;
+        let pm = 0;
+        const personMap = etpm[collabId];
+        if (personMap && Object.keys(personMap).length) {
+          pm = taskMonths.reduce((s, m) => {
+            const entry = personMap[m];
+            if (!entry || entry.active === false) return s;
+            return s + (parseFloat(entry.rate ?? etp[collabId]) || 0);
+          }, 0);
+        } else {
+          pm = (parseFloat(etp[collabId]) || 0) * taskMonths.length;
+        }
+        if (!pm) return;
+        const k = `${c.be_id}__${wp.id}`;
         if (!summary[k]) summary[k] = {};
         const catId = c.profile;
         if (!catId) return;
-        if (!summary[k][catId]) summary[k][catId] = { pm: 0, salary: c.monthly_salary||0, emp_count: 0 };
+        if (!summary[k][catId]) summary[k][catId] = { pm: 0, salary: c.monthly_salary||0 };
         summary[k][catId].pm += pm;
-        summary[k][catId].emp_count++;
       });
     });
   });
@@ -1096,57 +1590,46 @@ function renderGanttEtpSummary() {
 }
 
 function applyGanttToEtp() {
-  // For each WP × task, compute person-months from months × etp_rate, store back into task.etp
-  // Then sync tasks to state and update cost forms
-  const collab = getAllCollaborators();
-  let updated = 0;
-
-  (state.work_packages||[]).forEach(wp => {
-    const tasks = wpTasks[wp.id] || (state.tasks?.[wp.id] ? JSON.parse(JSON.stringify(state.tasks[wp.id])) : []);
-    if (!wpTasks[wp.id]) wpTasks[wp.id] = tasks;
-    tasks.forEach((task, ti) => {
-      const dur = (task.months||[]).length;
-      (task.participants_list||[]).forEach(collabId => {
-        const c = collab.find(x => x.id === collabId);
-        if (!c || c.type !== 'emp') return;
-        const etpRate = parseFloat(task.etp?.[collabId]) || 0;
-        // Keep monthly etp rate as-is; the duration drives total PM
-        // We just ensure ETP is set
-        if (!task.etp) task.etp = {};
-      });
-    });
-    // Save tasks back to state
-    if (!state.tasks) state.tasks = {};
-    state.tasks[wp.id] = JSON.parse(JSON.stringify(tasks));
-  });
-
-  // Now auto-compute aggregated costs for all BE × WP combinations
+  syncWpTasksFromState(); // ensure all WP tasks are loaded
   autoApplyEtpToCosts();
   renderGanttEtpSummary();
   showToast('ETP recalculés depuis le Gantt et budget mis à jour ✓');
 }
 
 function autoApplyEtpToCosts() {
-  // Aggregate person-months from Gantt (months × etp_rate) per BE × WP × profile
   const collab = getAllCollaborators();
   if (!state.costs) state.costs = {};
 
   (state.beneficiaries||[]).forEach(be => {
     (state.work_packages||[]).forEach(wp => {
       const tasks = wpTasks[wp.id] || state.tasks?.[wp.id] || [];
-      const catPM = {}; // catId → { totalPM, salaries }
+      const wpDuration = (wp.end_month||24) - (wp.start_month||1) + 1;
+      const catPM = {};
 
       tasks.forEach(task => {
-        const dur = (task.months||[]).length;
-        if (!dur) return;
+        const taskMonths = task.months || [];
+        // Fallback: no Gantt months → use WP duration
+        const duration = taskMonths.length > 0 ? taskMonths.length : wpDuration;
+        const etp = task.etp || {};
+        const etpm = task.etp_months || {};
         (task.participants_list||[]).forEach(collabId => {
           const c = collab.find(x => x.id === collabId);
           if (!c || c.type !== 'emp' || c.be_id !== be.id) return;
-          const etpRate = parseFloat(task.etp?.[collabId]) || 0;
-          const pm = etpRate * dur;
-          if (!pm) return;
           const catId = c.profile;
           if (!catId) return;
+
+          let pm = 0;
+          const personMap = etpm[collabId];
+          if (personMap && Object.keys(personMap).length) {
+            pm = taskMonths.reduce((s, m) => {
+              const entry = personMap[m];
+              if (!entry || entry.active === false) return s;
+              return s + (parseFloat(entry.rate ?? etp[collabId]) || 0);
+            }, 0);
+          } else {
+            pm = (parseFloat(etp[collabId]) || 0) * duration;
+          }
+          if (!pm) return;
           if (!catPM[catId]) catPM[catId] = { totalPM: 0, salaries: [] };
           catPM[catId].totalPM += pm;
           if (c.monthly_salary) catPM[catId].salaries.push(c.monthly_salary);
@@ -1163,26 +1646,24 @@ function autoApplyEtpToCosts() {
           state.costs[key][`${catId}_rate`] = avg.toFixed(2);
         }
       });
-      // Push to server
       post('/api/costs', { be_id: be.id, wp_id: wp.id, costs: state.costs[key] });
     });
   });
 
-  // If cost form is open, refresh it
   const beId = document.getElementById('cost-be-select')?.value;
   const wpId = document.getElementById('cost-wp-select')?.value;
   if (beId && wpId) loadCostForm();
 }
 
 async function saveGantt() {
-  // Save all wpTasks back
-  const saves = [];
-  for (const [wpId, tasks] of Object.entries(wpTasks)) {
-    saves.push(post(`/api/tasks/${wpId}`, {tasks}).then(() => {
+  syncWpTasksFromState(); // fill any WPs not yet in wpTasks
+  const saves = Object.entries(wpTasks).map(([wpId, tasks]) =>
+    post(`/api/tasks/${wpId}`, {tasks}).then(() => {
       if (!state.tasks) state.tasks = {};
       state.tasks[wpId] = JSON.parse(JSON.stringify(tasks));
-    }));
-  }
+      _wpTasksDirty.delete(wpId); // saved — no longer dirty
+    })
+  );
   await Promise.all(saves);
   showToast('Gantt enregistré ✓');
 }
@@ -1205,12 +1686,12 @@ function _renderPrevProjects(){
   if(!tbody) return;
   if(!localPrevProjects.length){tbody.innerHTML='<tr><td colspan="7" class="empty-state">Aucun projet précédent.</td></tr>';return;}
   tbody.innerHTML=localPrevProjects.map((p,i)=>`<tr>
-    <td><input type="text" value="${esc(p.participant||'')}" onchange="localPrevProjects[${i}].participant=this.value"></td>
-    <td><input type="text" value="${esc(p.reference||'')}" onchange="localPrevProjects[${i}].reference=this.value"></td>
-    <td><input type="text" value="${esc(p.period||'')}" onchange="localPrevProjects[${i}].period=this.value" placeholder="MM/YYYY – MM/YYYY"></td>
-    <td><select onchange="localPrevProjects[${i}].role=this.value">${['COO','BEN','AE','OTHER'].map(r=>`<option ${p.role===r?'selected':''}>${r}</option>`).join('')}</select></td>
-    <td><input type="number" value="${p.amount||''}" onchange="localPrevProjects[${i}].amount=parseFloat(this.value)"></td>
-    <td><input type="text" value="${esc(p.website||'')}" onchange="localPrevProjects[${i}].website=this.value" placeholder="https://..."></td>
+    <td><input type="text" value="${esc(p.participant||'')}" onchange="localPrevProjects[${i}].participant=this.value;debouncedSave('prevProjects', savePreviousProjects)"></td>
+    <td><input type="text" value="${esc(p.reference||'')}" onchange="localPrevProjects[${i}].reference=this.value;debouncedSave('prevProjects', savePreviousProjects)"></td>
+    <td><input type="text" value="${esc(p.period||'')}" onchange="localPrevProjects[${i}].period=this.value;debouncedSave('prevProjects', savePreviousProjects)" placeholder="MM/YYYY – MM/YYYY"></td>
+    <td><select onchange="localPrevProjects[${i}].role=this.value;debouncedSave('prevProjects', savePreviousProjects)">${['COO','BEN','AE','OTHER'].map(r=>`<option ${p.role===r?'selected':''}>${r}</option>`).join('')}</select></td>
+    <td><input type="number" value="${p.amount||''}" onchange="localPrevProjects[${i}].amount=parseFloat(this.value);debouncedSave('prevProjects', savePreviousProjects)"></td>
+    <td><input type="text" value="${esc(p.website||'')}" onchange="localPrevProjects[${i}].website=this.value;debouncedSave('prevProjects', savePreviousProjects)" placeholder="https://..."></td>
     <td><button class="btn btn-sm btn-danger" onclick="localPrevProjects.splice(${i},1);_renderPrevProjects()">🗑️</button></td>
   </tr>`).join('');
 }
@@ -1240,16 +1721,16 @@ function _renderDeprecTable(){
     const pl=parseFloat(item.pct_life||0);
     const charged=cost*(pp/100)*(pl/100);
     return `<tr>
-      <td><select onchange="localDeprec[${i}].be=this.value"><option>–</option>${beOpts}</select></td>
-      <td><select onchange="localDeprec[${i}].wp=this.value"><option>–</option>${wpOpts}</select></td>
-      <td><input type="text" value="${esc(item.resource_type||'')}" onchange="localDeprec[${i}].resource_type=this.value"></td>
-      <td><input type="text" value="${esc(item.description||'')}" onchange="localDeprec[${i}].description=this.value"></td>
-      <td><input type="date" value="${item.purchase_date||''}" onchange="localDeprec[${i}].purchase_date=this.value"></td>
-      <td><input type="number" min="0" value="${item.purchase_cost||''}" onchange="localDeprec[${i}].purchase_cost=this.value;calcDeprec(${i})" placeholder="0"></td>
-      <td><input type="number" min="0" max="100" value="${item.pct_project||''}" onchange="localDeprec[${i}].pct_project=this.value;calcDeprec(${i})" placeholder="100"></td>
-      <td><input type="number" min="0" max="100" value="${item.pct_life||''}" onchange="localDeprec[${i}].pct_life=this.value;calcDeprec(${i})" placeholder="50"></td>
+      <td><select onchange="localDeprec[${i}].be=this.value;debouncedSave('depreciation', saveDepreciation)"><option>–</option>${beOpts}</select></td>
+      <td><select onchange="localDeprec[${i}].wp=this.value;debouncedSave('depreciation', saveDepreciation)"><option>–</option>${wpOpts}</select></td>
+      <td><input type="text" value="${esc(item.resource_type||'')}" onchange="localDeprec[${i}].resource_type=this.value;debouncedSave('depreciation', saveDepreciation)"></td>
+      <td><input type="text" value="${esc(item.description||'')}" onchange="localDeprec[${i}].description=this.value;debouncedSave('depreciation', saveDepreciation)"></td>
+      <td><input type="date" value="${item.purchase_date||''}" onchange="localDeprec[${i}].purchase_date=this.value;debouncedSave('depreciation', saveDepreciation)"></td>
+      <td><input type="number" min="0" value="${item.purchase_cost||''}" onchange="localDeprec[${i}].purchase_cost=this.value;calcDeprec(${i});debouncedSave('depreciation', saveDepreciation)" placeholder="0"></td>
+      <td><input type="number" min="0" max="100" value="${item.pct_project||''}" onchange="localDeprec[${i}].pct_project=this.value;calcDeprec(${i});debouncedSave('depreciation', saveDepreciation)" placeholder="100"></td>
+      <td><input type="number" min="0" max="100" value="${item.pct_life||''}" onchange="localDeprec[${i}].pct_life=this.value;calcDeprec(${i});debouncedSave('depreciation', saveDepreciation)" placeholder="50"></td>
       <td id="dep_charged_${i}" style="text-align:right;font-weight:700;color:var(--blue)">${charged>0?fmt(charged):'–'}</td>
-      <td><input type="text" value="${esc(item.justification||'')}" onchange="localDeprec[${i}].justification=this.value"></td>
+      <td><input type="text" value="${esc(item.justification||'')}" onchange="localDeprec[${i}].justification=this.value;debouncedSave('depreciation', saveDepreciation)"></td>
       <td><button class="btn btn-sm btn-danger" onclick="localDeprec.splice(${i},1);_renderDeprecTable()">🗑️</button></td>
     </tr>`;
   }).join('');
@@ -1281,9 +1762,9 @@ function _renderCommentsTable(){
   const wpOpts=(state.work_packages||[]).map(w=>`<option value="${w.id}">${w.id}</option>`).join('');
   tbody.innerHTML=localComments.map((c,i)=>`<tr>
     <td>${i+1}</td>
-    <td><select onchange="localComments[${i}].be_ref=this.value"><option value="">–</option>${beOpts}</select></td>
-    <td><select onchange="localComments[${i}].wp_ref=this.value"><option value="">–</option>${wpOpts}</select></td>
-    <td><textarea rows="2" onchange="localComments[${i}].text=this.value">${esc(c.text||'')}</textarea></td>
+    <td><select onchange="localComments[${i}].be_ref=this.value;debouncedSave('comments', saveComments)"><option value="">–</option>${beOpts}</select></td>
+    <td><select onchange="localComments[${i}].wp_ref=this.value;debouncedSave('comments', saveComments)"><option value="">–</option>${wpOpts}</select></td>
+    <td><textarea rows="2" onchange="localComments[${i}].text=this.value;debouncedSave('comments', saveComments)">${esc(c.text||'')}</textarea></td>
     <td><button class="btn btn-sm btn-danger" onclick="localComments.splice(${i},1);_renderCommentsTable()">🗑️</button></td>
   </tr>`).join('');
 }
@@ -1296,8 +1777,16 @@ async function saveComments(){
 
 // ---- RESULTS ----
 async function loadResults(){
+  // Flush any pending saves before computing results
+  await flushAllPendingSaves();
   const res=await fetch('/api/results');
+  if (!res.ok) { showToast('Erreur lors du calcul des résultats'); return; }
   const data=await res.json();
+  if (!data.state?.beneficiaries?.length) {
+    document.getElementById('results-container').innerHTML =
+      '<div class="empty-state">⚠️ Aucune donnée trouvée. Chargez une session via le bouton 💾 Sessions.</div>';
+    return;
+  }
   renderResults(data);
 }
 function renderResults(data){
@@ -1369,6 +1858,63 @@ function renderResults(data){
   container.innerHTML=html;
 }
 
+// ---- Flush all pending debounced saves ----
+async function flushAllPendingSaves() {
+  // Cancel all pending timers and fire them immediately
+  const pbPromises = Object.keys(pbTimers).map(field => {
+    if (pbTimers[field]) {
+      clearTimeout(pbTimers[field]);
+      pbTimers[field] = null;
+      const el = document.getElementById('pb_' + field);
+      if (!el) return;
+      const value = el.type === 'checkbox' ? el.checked : el.value;
+      return fetch('/api/part_b', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({[field]: value})
+      }).then(() => { if (!state.part_b) state.part_b = {}; state.part_b[field] = value; });
+    }
+  }).filter(Boolean);
+
+  // Flush all other debounced saves
+  Object.keys(_debouncedTimers).forEach(key => {
+    if (_debouncedTimers[key]) {
+      clearTimeout(_debouncedTimers[key]);
+      _debouncedTimers[key] = null;
+    }
+  });
+  Object.keys(_autoSaveTaskTimers).forEach(wpId => {
+    if (_autoSaveTaskTimers[wpId]) {
+      clearTimeout(_autoSaveTaskTimers[wpId]);
+      _autoSaveTaskTimers[wpId] = null;
+      saveTasks(wpId);
+    }
+  });
+  Object.keys(_autoSaveMsTimers).forEach(wpId => {
+    if (_autoSaveMsTimers[wpId]) {
+      clearTimeout(_autoSaveMsTimers[wpId]);
+      _autoSaveMsTimers[wpId] = null;
+      saveMilestones(wpId);
+    }
+  });
+  Object.keys(_autoSaveDelTimers).forEach(wpId => {
+    if (_autoSaveDelTimers[wpId]) {
+      clearTimeout(_autoSaveDelTimers[wpId]);
+      _autoSaveDelTimers[wpId] = null;
+      saveDeliverables(wpId);
+    }
+  });
+
+  // Flush Gantt months data
+  syncWpTasksFromState();
+  const ganttSaves = Object.entries(wpTasks).map(([wpId, tasks]) =>
+    post(`/api/tasks/${wpId}`, {tasks}).then(() => {
+      if (!state.tasks) state.tasks = {};
+      state.tasks[wpId] = JSON.parse(JSON.stringify(tasks));
+    })
+  );
+  await Promise.all([...pbPromises, ...ganttSaves]);
+}
+
 // ---- SESSIONS ----
 async function openSessionsPanel(){await refreshSessionsList();document.getElementById('sessions-overlay').classList.add('open');}
 function closeSessionsPanel(){document.getElementById('sessions-overlay').classList.remove('open');}
@@ -1398,6 +1944,7 @@ async function refreshSessionsList(){
 async function saveSession(){
   const name=document.getElementById('session-name-input').value.trim();
   if(!name){alert('Donnez un nom à la session.');return;}
+  await flushAllPendingSaves();
   const res=await post('/api/sessions',{name});
   const json=await res.json();
   if(json.error){alert(json.error);return;}
@@ -1407,6 +1954,7 @@ async function saveSession(){
 }
 async function overwriteSession(sid, name) {
   if (!confirm(`Écraser la session « ${name} » avec les données actuelles ?`)) return;
+  await flushAllPendingSaves();
   await del(`/api/sessions/${sid}`);
   const res = await post('/api/sessions', { name });
   const json = await res.json();
@@ -1475,6 +2023,11 @@ async function resetAll(){
 }
 
 // ---- UTILS ----
+const _debouncedTimers = {};
+function debouncedSave(key, fn, delay=800) {
+  clearTimeout(_debouncedTimers[key]);
+  _debouncedTimers[key] = setTimeout(fn, delay);
+}
 function fmt(n){if(n===null||n===undefined||isNaN(n)) return '–';return new Intl.NumberFormat('fr-FR',{style:'currency',currency:'EUR',maximumFractionDigits:2}).format(n);}
 function esc(s){if(!s) return '';return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function v(id){const el=document.getElementById(id);return el?el.value:'';}

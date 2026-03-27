@@ -1,22 +1,97 @@
 from flask import Flask, render_template, request, jsonify, session
-import json, uuid, os
+import json, uuid, os, threading, tempfile, shutil
 from datetime import datetime
 
 app = Flask(__name__)
 app.secret_key = 'horizon-budget-2026'
-app.config['SESSION_COOKIE_SIZE'] = 8192
 
-SESSIONS_FILE = os.path.join(os.path.dirname(__file__), 'saved_sessions.json')
+SESSIONS_FILE  = os.path.join(os.path.dirname(__file__), 'saved_sessions.json')
+WORKDIR        = os.path.join(os.path.dirname(__file__), 'workstates')
+os.makedirs(WORKDIR, exist_ok=True)
 
+# Per-file locks to prevent concurrent read/write corruption
+_file_locks = {}
+_file_locks_lock = threading.Lock()
+
+def _get_lock(path):
+    with _file_locks_lock:
+        if path not in _file_locks:
+            _file_locks[path] = threading.Lock()
+        return _file_locks[path]
+
+# ---- Named sessions (user-saved) ----
 def load_saved_sessions():
-    if os.path.exists(SESSIONS_FILE):
-        with open(SESSIONS_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+    if not os.path.exists(SESSIONS_FILE):
+        return {}
+    lock = _get_lock(SESSIONS_FILE)
+    with lock:
+        try:
+            with open(SESSIONS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
 
 def write_saved_sessions(sessions):
-    with open(SESSIONS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(sessions, f, ensure_ascii=False, indent=2)
+    lock = _get_lock(SESSIONS_FILE)
+    with lock:
+        _atomic_write(SESSIONS_FILE, sessions, indent=2)
+
+# ---- Atomic JSON write (write to temp file, then rename) ----
+def _atomic_write(path, data, indent=None):
+    """Write JSON atomically: temp file → rename. Prevents partial writes."""
+    dir_ = os.path.dirname(path)
+    fd, tmp_path = tempfile.mkstemp(dir=dir_, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+        shutil.move(tmp_path, path)
+    except Exception:
+        try: os.unlink(tmp_path)
+        except OSError: pass
+        raise
+
+# ---- Working state stored as a server-side file, not in the cookie ----
+def _get_sid():
+    if 'sid' not in session:
+        session['sid'] = str(uuid.uuid4())
+    return session['sid']
+
+def _state_path(sid):
+    return os.path.join(WORKDIR, f'{sid}.json')
+
+def get_state():
+    sid = _get_sid()
+    path = _state_path(sid)
+    lock = _get_lock(path)
+    with lock:
+        s = None
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    content = f.read().strip()
+                    if content:
+                        s = json.loads(content)
+            except (json.JSONDecodeError, OSError):
+                s = None  # corrupted file → start fresh
+        if s is None:
+            s = init_state()
+    # Migrate missing keys (outside lock — no IO)
+    defaults = init_state()
+    for k, v in defaults.items():
+        if k not in s: s[k] = v
+    if 'part_b' not in s:
+        s['part_b'] = defaults['part_b']
+    else:
+        for k, v in defaults['part_b'].items():
+            if k not in s['part_b']: s['part_b'][k] = v
+    return s
+
+def save_state(state):
+    sid = _get_sid()
+    path = _state_path(sid)
+    lock = _get_lock(path)
+    with lock:
+        _atomic_write(path, state)
 
 COUNTRIES = [
     {"name":"Austria (AT)","coeff":1.094},{"name":"Belgium (BE)","coeff":1.0},
@@ -93,23 +168,6 @@ def init_state():
         "costs":{},"depreciation":[],"comments":[],
         "subcontracting":[],"purchases":{},"milestones":{},"deliverables":{},"tasks":{},"timetable":[],
     }
-
-def get_state():
-    if 'state' not in session:
-        session['state'] = init_state()
-    s = session['state']
-    defaults = init_state()
-    for k,v in defaults.items():
-        if k not in s: s[k]=v
-    if 'part_b' not in s: s['part_b']=defaults['part_b']
-    else:
-        for k,v in defaults['part_b'].items():
-            if k not in s['part_b']: s['part_b'][k]=v
-    return s
-
-def save_state(state):
-    session['state']=state
-    session.modified=True
 
 def calc_totals(state):
     results={}
@@ -292,7 +350,8 @@ def api_results():
 
 @app.route('/api/reset', methods=['POST'])
 def api_reset():
-    session['state']=init_state(); session.modified=True; return jsonify({"ok":True})
+    save_state(init_state())
+    return jsonify({"ok":True})
 
 @app.route('/api/sessions', methods=['GET'])
 def api_list_sessions():
@@ -316,8 +375,9 @@ def api_save_session():
 def api_load_session(sid):
     sessions=load_saved_sessions()
     if sid not in sessions: return jsonify({"error":"Session introuvable."}),404
-    session['state']=sessions[sid]["state"]; session.modified=True
-    return jsonify({"ok":True,"state":sessions[sid]["state"]})
+    loaded = sessions[sid]["state"]
+    save_state(loaded)
+    return jsonify({"ok":True,"state":loaded})
 
 @app.route('/api/sessions/<sid>', methods=['PUT'])
 def api_rename_session(sid):
@@ -384,6 +444,19 @@ def build_rtf(state, totals):
     timetable = state.get('timetable', [])
     subcontracting = state.get('subcontracting', [])
 
+    # Build a flat id→label map for resolving emp IDs and BE IDs to human names
+    collab_map = {}
+    for be in bes:
+        collab_map[f'BE_{be["id"]}'] = f'{be.get("name", be["id"])} ({be.get("role","BEN")})'
+        for emp in employees.get(be['id'], []):
+            name = ' '.join(filter(None, [emp.get('last_name',''), emp.get('first_name','')])) or emp.get('id','?')
+            collab_map[emp['id']] = f'{name} ({be.get("acronym") or be.get("name","?")})'
+
+    def resolve_participants(id_list):
+        if not id_list: return ''
+        if isinstance(id_list, str): id_list = [id_list]
+        return ', '.join(collab_map.get(i, i) for i in id_list if i)
+
     # RTF color/font table
     header = (
         r'{\rtf1\ansi\ansicpg1252\deff0'
@@ -411,6 +484,37 @@ def build_rtf(state, totals):
     def h3(text): p(text, bold=True, size=24, color=1, space_before=120, space_after=60)
     def body(text, indent=0): p(text, size=22, indent=indent, space_after=80)
     def rule(): lines.append(r'{\pard\brdrb\brdrs\brdrw10\brsp20\par}' + '\n')
+
+    # ---- RTF table helpers ----
+    # RTF REQUIRES \trowd redefined before EVERY \row (header AND data rows)
+    # We encapsulate this properly.
+
+    def make_row_def(widths):
+        """Return the \trowd string for a row with given cumulative cell widths."""
+        rd = r'\trowd\trgaph60\trleft-60'
+        for w in widths: rd += f'\\cellx{w}'
+        return rd
+
+    def tbl_begin(widths, headers, header_color=2):
+        """Emit a table header row. widths = list of cumulative x positions."""
+        rd = make_row_def(widths)
+        lines.append('{' + rd + '\n')
+        for hdr in headers:
+            lines.append(r'{\pard\f1\fs20\b\cf' + str(header_color) + ' ' + rtf_escape(hdr) + r'\b0\cell}')
+        lines.append(r'\row}' + '\n')
+
+    def tbl_row(widths, values, bold=False):
+        """Emit one data row. Must repeat \trowd for each row."""
+        rd = make_row_def(widths)
+        lines.append('{' + rd + '\n')
+        for val in values:
+            prefix = r'{\pard\f1\fs20\b ' if bold else r'{\pard\f1\fs20 '
+            suffix = r'\b0\cell}' if bold else r'\cell}'
+            lines.append(prefix + rtf_escape(str(val) if val is not None else '') + suffix)
+        lines.append(r'\row}' + '\n')
+
+    def tbl_end():
+        pass  # rows are self-contained with braces, no explicit end needed
 
     # ======= COVER PAGE =======
     lines.append(r'{\pard\qc\sb720\f1\fs48\b\cf2 ' + rtf_escape('TECHNICAL DESCRIPTION (PART B)') + r'\b0\par}' + '\n')
@@ -455,22 +559,13 @@ def build_rtf(state, totals):
     risks = pb.get('risks', [])
     if risks:
         h3('Risques critiques')
-        lines.append(r'{\pard\sb60\f1\fs22' + '\n')
-        lines.append(r'{\trowd\trgaph60\trleft-60')
-        widths = [800, 3000, 800, 3000, 800, 800]
-        pos = 0
-        for w in widths:
-            pos += w
-            lines.append(f'\\cellx{pos}')
-        lines.append('\n')
-        for hdr in ['N°','Description','WP','Atténuation','Impact','Probabilité']:
-            lines.append(r'{\pard\f1\fs20\b\cf2 ' + rtf_escape(hdr) + r'\b0\cell}')
-        lines.append(r'\row' + '\n')
+        widths = [800, 3800, 1200, 5000, 6200, 7200]  # cumulative
+        # Convert to cumulative positions
+        cum = [800, 3800, 5000, 7400, 8600, 9200]
+        tbl_begin(cum, ['N°','Description','WP','Atténuation','Impact','Probabilité'])
         for i, r_ in enumerate(risks):
-            for val in [str(i+1), r_.get('description',''), r_.get('wp',''), r_.get('mitigation',''), r_.get('impact',''), r_.get('probability','')]:
-                lines.append(r'{\pard\f1\fs20 ' + rtf_escape(val) + r'\cell}')
-            lines.append(r'\row' + '\n')
-        lines.append(r'}' + '\n')
+            tbl_row(cum, [str(i+1), r_.get('description',''), r_.get('wp',''),
+                          r_.get('mitigation',''), r_.get('impact',''), r_.get('probability','')])
 
     h2('2.3 Capacité à réaliser le travail')
     body(pb.get('consortium_cooperation','(non renseigné)'))
@@ -479,15 +574,10 @@ def build_rtf(state, totals):
     staff_table = pb.get('staff_table', [])
     if staff_table:
         h3('Équipes et personnel')
-        lines.append(r'{\trowd\trgaph60\trleft-60\cellx3000\cellx5500\cellx9200' + '\n')
-        for hdr in ['Nom / Fonction','Organisation','Rôle / Profil']:
-            lines.append(r'{\pard\f1\fs20\b\cf2 ' + rtf_escape(hdr) + r'\b0\cell}')
-        lines.append(r'\row' + '\n')
+        cum = [3000, 5500, 9200]
+        tbl_begin(cum, ['Nom / Fonction','Organisation','Rôle / Profil'])
         for s in staff_table:
-            for val in [s.get('name_function',''), s.get('organisation',''), s.get('role','')]:
-                lines.append(r'{\pard\f1\fs20 ' + rtf_escape(val) + r'\cell}')
-            lines.append(r'\row' + '\n')
-        lines.append(r'}' + '\n')
+            tbl_row(cum, [s.get('name_function',''), s.get('organisation',''), s.get('role','')])
 
     if pb.get('outside_resources'):
         h3('Ressources externes')
@@ -522,93 +612,67 @@ def build_rtf(state, totals):
         if wp.get('objectives'): body(f'Objectifs : {wp.get("objectives","")}', indent=360)
         if wp.get('description'): body(wp.get('description',''), indent=360)
 
-        # Tasks
+        # Tasks — resolved participant names + trowd on every row
         wp_tasks = tasks.get(wid, [])
         if wp_tasks:
             h3(f'Tâches — {wid}')
-            lines.append(r'{\trowd\trgaph60\trleft-60\cellx800\cellx2400\cellx5400\cellx7600\cellx9200' + '\n')
-            for hdr in ['N°','Nom','Description','Participants','Sous-traitance']:
-                lines.append(r'{\pard\f1\fs20\b\cf2 ' + rtf_escape(hdr) + r'\b0\cell}')
-            lines.append(r'\row' + '\n')
+            cum = [800, 2600, 5200, 7800, 9200]
+            tbl_begin(cum, ['N°','Nom','Description','Participants','Sous-traitance'])
             for t in wp_tasks:
-                participants = t.get('participants_list', [])
-                if isinstance(participants, list):
-                    part_str = ', '.join(participants)
-                else:
-                    part_str = str(participants)
-                for val in [t.get('num',''), t.get('name',''), t.get('description',''), part_str, t.get('subcontracting','')]:
-                    lines.append(r'{\pard\f1\fs20 ' + rtf_escape(val) + r'\cell}')
-                lines.append(r'\row' + '\n')
-            lines.append(r'}' + '\n')
+                part_str = resolve_participants(t.get('participants_list', []))
+                tbl_row(cum, [t.get('num',''), t.get('name',''), t.get('description',''),
+                              part_str, t.get('subcontracting','')])
 
         # Milestones
         wp_ms = milestones.get(wid, [])
         if wp_ms:
             h3(f'Jalons — {wid}')
-            lines.append(r'{\trowd\trgaph60\trleft-60\cellx600\cellx2600\cellx3600\cellx6000\cellx7200\cellx9200' + '\n')
-            for hdr in ['N°','Nom','Lead','Description','Mois','Vérification']:
-                lines.append(r'{\pard\f1\fs20\b\cf2 ' + rtf_escape(hdr) + r'\b0\cell}')
-            lines.append(r'\row' + '\n')
+            cum = [600, 2600, 3600, 6000, 7200, 9200]
+            tbl_begin(cum, ['N°','Nom','Lead','Description','Mois','Vérification'])
             for m in wp_ms:
-                for val in [m.get('num',''), m.get('name',''), m.get('lead',''), m.get('description',''), str(m.get('due_month','')), m.get('verification','')]:
-                    lines.append(r'{\pard\f1\fs20 ' + rtf_escape(val) + r'\cell}')
-                lines.append(r'\row' + '\n')
-            lines.append(r'}' + '\n')
+                tbl_row(cum, [m.get('num',''), m.get('name',''), m.get('lead',''),
+                              m.get('description',''), str(m.get('due_month','')), m.get('verification','')])
 
         # Deliverables
         wp_del = deliverables.get(wid, [])
         if wp_del:
             h3(f'Livrables — {wid}')
-            lines.append(r'{\trowd\trgaph60\trleft-60\cellx600\cellx2200\cellx3200\cellx5000\cellx6400\cellx7200\cellx9200' + '\n')
-            for hdr in ['N°','Nom','Lead','Type','Diffusion','Mois','Description']:
-                lines.append(r'{\pard\f1\fs20\b\cf2 ' + rtf_escape(hdr) + r'\b0\cell}')
-            lines.append(r'\row' + '\n')
+            cum = [600, 2200, 3200, 5000, 6400, 7200, 9200]
+            tbl_begin(cum, ['N°','Nom','Lead','Type','Diffusion','Mois','Description'])
             for d in wp_del:
-                for val in [d.get('num',''), d.get('name',''), d.get('lead',''), d.get('type',''), d.get('dissemination',''), str(d.get('due_month','')), d.get('description','')]:
-                    lines.append(r'{\pard\f1\fs20 ' + rtf_escape(val) + r'\cell}')
-                lines.append(r'\row' + '\n')
-            lines.append(r'}' + '\n')
+                tbl_row(cum, [d.get('num',''), d.get('name',''), d.get('lead',''), d.get('type',''),
+                              d.get('dissemination',''), str(d.get('due_month','')), d.get('description','')])
 
     # Subcontracting
     if subcontracting:
         h2('Sous-traitance')
-        lines.append(r'{\trowd\trgaph60\trleft-60\cellx600\cellx1400\cellx2800\cellx5000\cellx6200\cellx7800\cellx9200' + '\n')
-        for hdr in ['WP','N°','Nom','Description','Coût (€)','Justification','Best Value']:
-            lines.append(r'{\pard\f1\fs20\b\cf2 ' + rtf_escape(hdr) + r'\b0\cell}')
-        lines.append(r'\row' + '\n')
+        cum = [600, 1400, 2800, 5000, 6200, 7800, 9200]
+        tbl_begin(cum, ['WP','N°','Nom','Description','Coût (€)','Justification','Best Value'])
         for s in subcontracting:
-            for val in [s.get('wp',''), s.get('num',''), s.get('name',''), s.get('description',''), fmt_eur(s.get('cost',0)), s.get('justification',''), s.get('best_value','')]:
-                lines.append(r'{\pard\f1\fs20 ' + rtf_escape(val) + r'\cell}')
-            lines.append(r'\row' + '\n')
-        lines.append(r'}' + '\n')
+            tbl_row(cum, [s.get('wp',''), s.get('num',''), s.get('name',''), s.get('description',''),
+                          fmt_eur(s.get('cost',0)), s.get('justification',''), s.get('best_value','')])
 
-    # Timetable
-    if timetable:
+    # Timetable (tasks from WP tasks with months)
+    has_timetable = any(
+        (t.get('months') or [])
+        for wid in [w['id'] for w in wps]
+        for t in tasks.get(wid, [])
+    )
+    if has_timetable:
         h2('Calendrier')
         dur = int(state.get('project_duration_months', 24))
         months = list(range(1, dur+1))
-        col_w = max(200, 9200 // (len(months)+1))
-        row_def = r'{\trowd\trgaph40\trleft-60'
-        row_def += f'\\cellx{col_w * 3}'  # task name wider
-        for mi, _ in enumerate(months, 1):
-            row_def += f'\\cellx{col_w*3 + col_w*mi}'
-        row_def += '\n'
-        lines.append(row_def)
-        lines.append(r'{\pard\f1\fs18\b\cf2 T\^ache\b0\cell}')
-        for m in months:
-            lines.append(r'{\pard\qc\f1\fs16\b\cf2 M' + str(m) + r'\b0\cell}')
-        lines.append(r'\row' + '\n')
-        for task in timetable:
-            lines.append(row_def)
-            lines.append(r'{\pard\f1\fs18 ' + rtf_escape(task.get('name','')) + r'\cell}')
-            active = task.get('months', [])
-            for m in months:
-                if m in active:
-                    lines.append(r'{\pard\qc\f1\fs18\cf3 \u9608?\cell}')
-                else:
-                    lines.append(r'{\pard\cell}')
-            lines.append(r'\row' + '\n')
-        lines.append(r'}' + '\n')
+        name_w = 2400
+        dur_cell_w = max(180, (9200 - name_w) // len(months)) if months else 280
+        cum_tt = [name_w] + [name_w + dur_cell_w * (i+1) for i in range(len(months))]
+        tbl_begin(cum_tt, ['Tâche / WP'] + [f'M{m}' for m in months])
+        for wp in wps:
+            wid = wp['id']
+            for t in tasks.get(wid, []):
+                if not t.get('months'): continue
+                label = f'{wid} · {t.get("num","")  } {t.get("name","")}'
+                cells = [label] + ['█' if m in t['months'] else '' for m in months]
+                tbl_row(cum_tt, cells)
 
     rule()
 
@@ -616,134 +680,101 @@ def build_rtf(state, totals):
     lines.append(r'\page' + '\n')
     h1('BUDGET — RÉSULTATS FINANCIERS')
 
-    # Global stats
-    global_F = sum(totals.get(be['id'],{}).get('total_F',0) for be in bes)
-    global_lump = sum(totals.get(be['id'],{}).get('lump_sum',0) for be in bes)
-    global_pm = sum(totals.get(be['id'],{}).get('person_months',0) for be in bes)
+    global_F    = sum(totals.get(be['id'],{}).get('total_F',0)    for be in bes)
+    global_lump = sum(totals.get(be['id'],{}).get('lump_sum',0)   for be in bes)
+    global_pm   = sum(totals.get(be['id'],{}).get('person_months',0) for be in bes)
 
-    p(f'Total coûts (F) : {fmt_eur(global_F)}   |   Lump Sum total demandé : {fmt_eur(global_lump)}   |   Person-mois totaux : {fmt_n(global_pm)}',
+    p(f'Total coûts (F) : {fmt_eur(global_F)}   |   Lump Sum demandé : {fmt_eur(global_lump)}   |   Person-mois : {fmt_n(global_pm)}',
       bold=False, size=24, color=2, space_before=60, space_after=120)
 
-    # Lump sum breakdown table
-    h2('Ventilation du Lump Sum — BE × WP')
+    # Lump sum breakdown BE × WP
     if bes and wps:
-        col_count = len(wps) + 4
-        be_col = 2000
-        wp_col = max(800, (9200 - be_col - 1200 - 800 - 1400) // len(wps)) if len(wps) else 1200
-        def make_row_def():
-            rd = r'{\trowd\trgaph60\trleft-60'
-            pos = be_col
-            rd += f'\\cellx{pos}'
-            for _ in wps:
-                pos += wp_col
-                rd += f'\\cellx{pos}'
-            pos += 1200; rd += f'\\cellx{pos}'
-            pos += 800;  rd += f'\\cellx{pos}'
-            pos += 1400; rd += f'\\cellx{pos}'
-            rd += '\n'
-            return rd
+        h2('Ventilation du Lump Sum — BE × WP')
+        be_w = 2200
+        wp_w = max(700, (9200 - be_w - 1200 - 700 - 1300) // len(wps)) if len(wps) else 1000
+        pos = be_w
+        cum_ls = [be_w]
+        for _ in wps:
+            pos += wp_w; cum_ls.append(pos)
+        pos += 1200; cum_ls.append(pos)
+        pos += 700;  cum_ls.append(pos)
+        pos += 1300; cum_ls.append(pos)
 
-        lines.append(make_row_def())
-        lines.append(r'{\pard\f1\fs20\b\cf2 B\u233?n\u233?ficiaire\b0\cell}')
-        for wp in wps: lines.append(r'{\pard\qc\f1\fs18\b\cf2 ' + rtf_escape(wp['id']) + r'\b0\cell}')
-        lines.append(r'{\pard\qr\f1\fs20\b\cf2 Total F\b0\cell}')
-        lines.append(r'{\pard\qc\f1\fs20\b\cf2 Taux\b0\cell}')
-        lines.append(r'{\pard\qr\f1\fs20\b\cf2 Lump Sum\b0\cell}')
-        lines.append(r'\row' + '\n')
-
+        tbl_begin(cum_ls, ['Bénéficiaire'] + [w['id'] for w in wps] + ['Total F','Taux','Lump Sum'])
         for be in bes:
             t = totals.get(be['id'], {})
-            lines.append(make_row_def())
-            lines.append(r'{\pard\f1\fs20 ' + rtf_escape(f"{be['id']} — {be.get('name','')}") + r'\cell}')
+            row_vals = [f"{be['id']} — {be.get('name','')}"]
             for wp in wps:
                 val = t.get('wps',{}).get(wp['id'],{}).get('_totals',{}).get('F',0)
-                lines.append(r'{\pard\qr\f1\fs20 ' + rtf_escape(fmt_eur(val) if val else '—') + r'\cell}')
-            lines.append(r'{\pard\qr\f1\fs20\b ' + rtf_escape(fmt_eur(t.get('total_F',0))) + r'\b0\cell}')
-            lines.append(r'{\pard\qc\f1\fs20 ' + rtf_escape(f"{t.get('funding_rate',1)*100:.0f}%") + r'\cell}')
-            lines.append(r'{\pard\qr\f1\fs20\b\cf4 ' + rtf_escape(fmt_eur(t.get('lump_sum',0))) + r'\b0\cell}')
-            lines.append(r'\row' + '\n')
-        lines.append(r'}' + '\n')
+                row_vals.append(fmt_eur(val) if val else '—')
+            row_vals += [fmt_eur(t.get('total_F',0)),
+                         f"{t.get('funding_rate',1)*100:.0f}%",
+                         fmt_eur(t.get('lump_sum',0))]
+            tbl_row(cum_ls, row_vals)
+        # Total row
+        tot_row = ['TOTAL']
+        for wp in wps:
+            s = sum(totals.get(be['id'],{}).get('wps',{}).get(wp['id'],{}).get('_totals',{}).get('F',0) for be in bes)
+            tot_row.append(fmt_eur(s))
+        tot_row += [fmt_eur(global_F), '—', fmt_eur(global_lump)]
+        tbl_row(cum_ls, tot_row, bold=True)
 
     # Person-months overview
-    h2('Vue d\'ensemble Person-Mois')
     if bes and wps:
-        lines.append(make_row_def())
-        lines.append(r'{\pard\f1\fs20\b\cf2 B\u233?n\u233?ficiaire\b0\cell}')
-        for wp in wps: lines.append(r'{\pard\qc\f1\fs18\b\cf2 ' + rtf_escape(wp['id']) + r'\b0\cell}')
-        lines.append(r'{\pard\qr\f1\fs20\b\cf2 Total PM\b0\cell}')
-        lines.append(r'{\pard\cell}{\pard\cell}')
-        lines.append(r'\row' + '\n')
+        h2('Vue d\'ensemble Person-Mois')
+        tbl_begin(cum_ls, ['Bénéficiaire'] + [w['id'] for w in wps] + ['Total PM','',''])
         for be in bes:
             t = totals.get(be['id'], {})
-            lines.append(make_row_def())
-            lines.append(r'{\pard\f1\fs20 ' + rtf_escape(f"{be['id']} — {be.get('name','')}") + r'\cell}')
+            row_vals = [f"{be['id']} — {be.get('name','')}"]
             for wp in wps:
                 pm = t.get('wps',{}).get(wp['id'],{}).get('_totals',{}).get('pm',0)
-                lines.append(r'{\pard\qr\f1\fs20 ' + rtf_escape(fmt_n(pm) if pm else '—') + r'\cell}')
-            lines.append(r'{\pard\qr\f1\fs20\b ' + rtf_escape(fmt_n(t.get('person_months',0))) + r'\b0\cell}')
-            lines.append(r'{\pard\cell}{\pard\cell}')
-            lines.append(r'\row' + '\n')
-        lines.append(r'}' + '\n')
+                row_vals.append(fmt_n(pm) if pm else '—')
+            row_vals += [fmt_n(t.get('person_months',0)), '', '']
+            tbl_row(cum_ls, row_vals)
 
     # Detail per BE
     for be in bes:
         t = totals.get(be['id'], {})
         if not t: continue
         h2(f"{be['id']} — {be.get('name','')} ({be.get('acronym','')})")
-        body(f"Pays : {be.get('country','–')}   |   Taux de financement : {t.get('funding_rate',1)*100:.0f}%")
+        body(f"Pays : {be.get('country','–')}   |   Taux : {t.get('funding_rate',1)*100:.0f}%")
 
         # Employees
         emps = employees.get(be['id'], [])
         if emps:
             h3('Équipe')
-            lines.append(r'{\trowd\trgaph60\trleft-60\cellx2400\cellx4400\cellx6800\cellx8000\cellx9200' + '\n')
-            for hdr in ['NOM','Prénom','Profil','Salaire/mois (€)','Note']:
-                lines.append(r'{\pard\f1\fs20\b\cf2 ' + rtf_escape(hdr) + r'\b0\cell}')
-            lines.append(r'\row' + '\n')
+            cum_e = [2400, 4400, 6800, 8000, 9200]
+            tbl_begin(cum_e, ['NOM','Prénom','Profil','Salaire/mois (€)','Note'])
             for emp in emps:
                 profile_label = next((p['label'] for p in STAFF_PROFILES if p['id']==emp.get('profile','')), emp.get('profile',''))
-                for val in [emp.get('last_name',''), emp.get('first_name',''), profile_label, fmt_eur(emp.get('monthly_salary',0)), emp.get('note','')]:
-                    lines.append(r'{\pard\f1\fs20 ' + rtf_escape(val) + r'\cell}')
-                lines.append(r'\row' + '\n')
-            lines.append(r'}' + '\n')
+                tbl_row(cum_e, [emp.get('last_name',''), emp.get('first_name',''),
+                                profile_label, fmt_eur(emp.get('monthly_salary',0)), emp.get('note','')])
 
         # Cost breakdown per WP
-        h3('Détail des coûts par WP')
         if wps:
-            wp_col2 = max(800, (9200 - 2500 - 1200) // len(wps)) if len(wps) else 1500
-            def make_cost_row():
-                rd = r'{\trowd\trgaph60\trleft-60\cellx2500'
-                pos = 2500
-                for _ in wps:
-                    pos += wp_col2; rd += f'\\cellx{pos}'
-                pos += 1200; rd += f'\\cellx{pos}'
-                rd += '\n'
-                return rd
+            h3('Détail des coûts par WP')
+            be_lbl_w = 2200
+            wp_cw = max(700, (9200 - be_lbl_w - 1200) // len(wps)) if len(wps) else 1000
+            pos2 = be_lbl_w
+            cum_c = [be_lbl_w]
+            for _ in wps:
+                pos2 += wp_cw; cum_c.append(pos2)
+            pos2 += 1200; cum_c.append(pos2)
 
-            lines.append(make_cost_row())
-            lines.append(r'{\pard\f1\fs20\b\cf2 Cat\u233?gorie\b0\cell}')
-            for wp in wps: lines.append(r'{\pard\qc\f1\fs18\b\cf2 ' + rtf_escape(wp['id']) + r'\b0\cell}')
-            lines.append(r'{\pard\qr\f1\fs20\b\cf2 Total\b0\cell}')
-            lines.append(r'\row' + '\n')
-            for sec_key, sec_label in [('A','Personnel'), ('B','Sous-traitance'), ('C','Achats'), ('D','Autres'), ('E','Indirects (25%)'), ('F','TOTAL')]:
-                lines.append(make_cost_row())
-                is_total = sec_key == 'F'
-                cell_start = r'{\pard\f1\fs20\b ' if is_total else r'{\pard\f1\fs20 '
-                lines.append(cell_start + rtf_escape(sec_label) + (r'\b0' if not is_total else '') + r'\cell}')
+            tbl_begin(cum_c, ['Catégorie'] + [w['id'] for w in wps] + ['Total'])
+            for sec_key, sec_label in [('A','Personnel'),('B','Sous-traitance'),
+                                        ('C','Achats'),('D','Autres'),
+                                        ('E','Indirects (25%)'),('F','TOTAL')]:
                 row_total = 0
+                vals = [sec_label]
                 for wp in wps:
                     val = t.get('wps',{}).get(wp['id'],{}).get('_totals',{}).get(sec_key,0)
                     row_total += val or 0
-                    lines.append(r'{\pard\qr\f1\fs20 ' + rtf_escape(fmt_eur(val) if val else '—') + r'\cell}')
-                lines.append((r'{\pard\qr\f1\fs20\b\cf2 ' if is_total else r'{\pard\qr\f1\fs20\b ') + rtf_escape(fmt_eur(row_total)) + r'\b0\cell}')
-                lines.append(r'\row' + '\n')
+                    vals.append(fmt_eur(val) if val else '—')
+                vals.append(fmt_eur(row_total))
+                tbl_row(cum_c, vals, bold=(sec_key=='F'))
             # Lump sum row
-            lines.append(make_cost_row())
-            lines.append(r'{\pard\f1\fs20\b\cf3 LUMP SUM DEMAND\u201?E\b0\cell}')
-            for _ in wps: lines.append(r'{\pard\cell}')
-            lines.append(r'{\pard\qr\f1\fs20\b\cf3 ' + rtf_escape(fmt_eur(t.get('lump_sum',0))) + r'\b0\cell}')
-            lines.append(r'\row' + '\n')
-            lines.append(r'}' + '\n')
+            tbl_row(cum_c, ['LUMP SUM'] + [''] * len(wps) + [fmt_eur(t.get('lump_sum',0))], bold=True)
 
     # ======= OTHER =======
     if pb.get('ethics') or pb.get('security'):
@@ -761,18 +792,17 @@ def build_rtf(state, totals):
     if prev:
         rule()
         h1('PROJETS PRÉCÉDENTS')
-        lines.append(r'{\trowd\trgaph60\trleft-60\cellx2000\cellx4200\cellx5400\cellx6000\cellx7400\cellx9200' + '\n')
-        for hdr in ['Participant','Référence & Titre','Période','Rôle','Montant (€)','Site web']:
-            lines.append(r'{\pard\f1\fs20\b\cf2 ' + rtf_escape(hdr) + r'\b0\cell}')
-        lines.append(r'\row' + '\n')
+        cum_pp = [2000, 4200, 5400, 6000, 7400, 9200]
+        tbl_begin(cum_pp, ['Participant','Référence & Titre','Période','Rôle','Montant (€)','Site web'])
         for proj in prev:
-            for val in [proj.get('participant',''), proj.get('reference',''), proj.get('period',''), proj.get('role',''), fmt_eur(proj.get('amount',0)), proj.get('website','')]:
-                lines.append(r'{\pard\f1\fs20 ' + rtf_escape(val) + r'\cell}')
-            lines.append(r'\row' + '\n')
-        lines.append(r'}' + '\n')
+            tbl_row(cum_pp, [proj.get('participant',''), proj.get('reference',''), proj.get('period',''),
+                             proj.get('role',''), fmt_eur(proj.get('amount',0)), proj.get('website','')])
 
     lines.append(r'}')
     return ''.join(lines)
+
+if __name__=='__main__':
+    app.run(debug=True,port=5000)
 
 if __name__=='__main__':
     app.run(debug=True,port=5000)

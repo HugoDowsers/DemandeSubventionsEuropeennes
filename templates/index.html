@@ -29,6 +29,7 @@
     <button class="tab" data-tab="partb">📝 Part B</button>
     <button class="tab" data-tab="depreciation">🔧 Amortissements</button>
     <button class="tab" data-tab="comments">💬 Commentaires</button>
+    <button class="tab" data-tab="verification">✅ Vérification ETP</button>
     <button class="tab tab-results" data-tab="results">📊 Résultats</button>
   </nav>
 </header>
@@ -187,8 +188,16 @@
       <div class="form-group"><label>Coopération au sein du consortium</label>
         <textarea id="pb_consortium_cooperation" rows="6" placeholder="Participants, complémentarité, division des rôles..." oninput="autoSavePartB('consortium_cooperation',this.value)"></textarea></div>
       <div class="form-group" style="margin-top:1rem">
-        <div class="section-header" style="margin-bottom:.5rem"><label>Équipes et personnel du projet</label>
-          <button class="btn btn-sm btn-primary" onclick="addStaffRow()">+ Ajouter</button></div>
+        <div class="section-header" style="margin-bottom:.5rem">
+          <label>Équipes et personnel du projet</label>
+          <div style="display:flex;gap:.5rem">
+            <button class="btn btn-sm btn-gold" onclick="syncStaffFromEmployees()" title="Importe automatiquement tous les employés saisis dans l'onglet Bénéficiaires">🔄 Sync depuis Équipe & Salaires</button>
+            <button class="btn btn-sm btn-primary" onclick="addStaffRow()">+ Ajouter manuellement</button>
+          </div>
+        </div>
+        <div class="info-box" style="margin-bottom:.75rem;padding:.6rem 1rem">
+          Le bouton <strong>🔄 Sync</strong> importe automatiquement tous les employés de l'onglet Bénéficiaires → Équipe & Salaires. Vous pouvez ensuite éditer librement les lignes.
+        </div>
         <table class="data-table" id="staff-table">
           <thead><tr><th>Nom et fonction</th><th>Organisation</th><th>Rôle / Tâches / Profil</th><th></th></tr></thead>
           <tbody id="staff-tbody"></tbody>
@@ -311,7 +320,25 @@
 
 </main>
 
-<!-- SESSIONS PANEL -->
+<!-- TAB: VERIFICATION ETP -->
+<section id="tab-verification" class="tab-content">
+  <div class="card">
+    <div class="section-header">
+      <h2>✅ Vérification de la cohérence des ETP</h2>
+      <button class="btn btn-primary" onclick="runEtpVerification()">🔍 Lancer la vérification</button>
+    </div>
+    <div class="info-box">
+      Vérifie que chaque personne n'a pas un ETP cumulé <strong>&gt; 1.0</strong> sur un même mois (surcharge),
+      et signale les mois avec ETP &lt; 0.1 (sous-utilisation potentielle).
+      Les calculs se basent sur les ETP saisis dans les tâches des Work Packages.
+    </div>
+    <div id="verification-container">
+      <div class="empty-state">Cliquez sur « Lancer la vérification » pour analyser les ETP.</div>
+    </div>
+  </div>
+</section>
+
+
 <div id="sessions-overlay" class="sessions-overlay" onclick="closeSessionsPanel()">
   <div class="sessions-panel" onclick="event.stopPropagation()">
     <div class="sessions-header"><h3>💾 Sessions sauvegardées</h3>
